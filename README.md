@@ -50,13 +50,23 @@ Admin istalgan o'qituvchiga bonus yoki jazo yozib qo'yishi mumkin — o'qituvchi
 pip install -r requirements.txt
 ```
 
-`.env` fayl kerak emas — barcha sozlamalar `config.py` faylida oddiy Python o'zgaruvchilari sifatida turadi. Botni ishga tushirishdan oldin `config.py` faylini ochib, quyidagilarni o'zingizga moslab to'g'ridan-to'g'ri o'zgartiring:
+Maxfiy **bot tokeni** environment variable orqali olinadi (GitHub'ga tushmaydi). Qolgan sozlamalar `config.py` faylida turadi.
 
-- `BOT_TOKEN` — @BotFather'dan olingan token
+**Lokal ishga tushirish:** shu papkada `.env` fayl yarating va ichiga yozing:
+
+```
+BOT_TOKEN=123456789:ABCdef...   # @BotFather'dan olingan o'z tokeningiz
+```
+
+`.env` fayli `.gitignore` orqali git'ga tushmaydi. Qolgan sozlamalarni `config.py` faylidan o'zgartirasiz:
+
 - `GROUP_CHAT_ID` — xabarlar yuboriladigan guruh IDsi (botni guruhga admin qilib qo'shing)
 - `ADMIN_IDS` — o'qituvchi qo'shish huquqiga ega shaxslarning Telegram ID raqamlari (masalan: `{123456789, 987654321}`)
 - `CENTER_LATITUDE`, `CENTER_LONGITUDE` — o'quv markazning lokatsiyasi
 - `RADIUS_METERS` — ruxsat etilgan masofa (metr)
+- `EARLY_REQUIRED_MINUTES`, `FINE_EARLY_PER_MINUTE`, `FINE_LATE_PER_MINUTE` — jarima sozlamalari
+
+`GROUP_CHAT_ID` va `ADMIN_IDS` ni ham xohlasangiz environment variable orqali o'zgartirish mumkin.
 
 ## Admin paneli (tugmalar orqali)
 
@@ -100,11 +110,14 @@ python main.py
 
 ## Railway'ga deploy qilish
 
-1. `config.py` faylida barcha qiymatlarni to'ldiring (BOT_TOKEN, GROUP_CHAT_ID va h.k.).
-2. Loyihani GitHub'ga yuklang.
-3. Railway'da yangi loyiha yarating va GitHub repo'ni ulang.
+1. Loyihani GitHub'ga yuklang (`git push`). Token GitHub'ga tushmaydi — u faqat `.env` faylida (git'dan tashqarida) turadi.
+2. Railway'da yangi loyiha yarating va GitHub repo'ni ulang.
+3. **Muhim:** Railway loyihasida **Variables** bo'limiga o'ting va yangi variable qo'shing:
+   - Nomi: `BOT_TOKEN`
+   - Qiymati: @BotFather'dan olingan tokeningiz
+   
+   Busiz bot ishga tushmaydi (`BOT_TOKEN topilmadi` xatosi chiqadi).
 4. `Procfile` avtomatik ravishda `worker: python main.py` jarayonini ishga tushiradi.
-5. Muhim: `config.py` ichidagi maxfiy ma'lumotlar (BOT_TOKEN) GitHub'da ochiq repo bo'lsa ko'rinib qoladi — agar repo public bo'lsa, uni private qiling.
 5. Diqqat: SQLite fayli (`attendance.db`) konteyner qayta ishga tushganda o'chib ketishi mumkin — agar davomat tarixini doimiy saqlamoqchi bo'lsangiz, Railway'ning Postgres qo'shimchasidan foydalanib, `main.py`dagi ma'lumotlar bazasi qismini PostgreSQL'ga moslashtirish tavsiya etiladi.
 
 ## Fayl tuzilishi
@@ -112,7 +125,8 @@ python main.py
 ```
 attendance_bot/
 ├── main.py            # Botning barcha kodi (baza, handlerlar, klaviaturalar)
-├── config.py          # Barcha sozlamalar shu yerda (BOT_TOKEN va h.k.)
+├── config.py          # Sozlamalar (BOT_TOKEN env'dan olinadi)
+├── .env               # Lokal token (git'ga tushmaydi)
 ├── requirements.txt
 └── Procfile           # Railway uchun
 ```
