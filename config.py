@@ -62,6 +62,13 @@ FINE_EARLY_PER_MINUTE = 5000
 # Belgilangan vaqtdan (09:00) keyin kechikkan har bir daqiqa uchun jarima (so'mda).
 FINE_LATE_PER_MINUTE = 7000
 
+# Belgilangan vaqtdan keyin jarima eng ko'pi shu daqiqagacha hisoblanadi.
+# Undan ham ko'proq kech qolsa — hisoblash to'xtaydi va ustozga ogohlantirish yuboriladi.
+LATE_FINE_CAP_MINUTES = 10
+
+# Necha marta "keragidan ortiq kechikish" (ogohlantirish) bo'lsa qattiq chora ko'riladi.
+WARNING_STRIKE_LIMIT = 3
+
 # Vaqt zonasi
 TIMEZONE = "Asia/Tashkent"
 

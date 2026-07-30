@@ -30,7 +30,15 @@ Ustoz belgilangan vaqtdan **5 daqiqa oldin** kelishi kerak. Masalan belgilangan 
 
 Har bir "keldim"da jarima avtomatik hisoblanadi, guruhga va ustozga xabar sifatida boradi hamda PDF hisobotga tushadi. Dam olish kunlarida jarima hisoblanmaydi.
 
-Bu qiymatlar (`5 daqiqa`, `5 000`, `7 000`) `config.py` faylida `EARLY_REQUIRED_MINUTES`, `FINE_EARLY_PER_MINUTE`, `FINE_LATE_PER_MINUTE` orqali o'zgartiriladi.
+### Ortiqcha kechikish va ogohlantirish
+
+Belgilangan vaqtdan **10 daqiqadan ortiq** kech qolsa, jarima hisoblash 10 daqiqada **to'xtaydi** (ya'ni kech qism eng ko'pi 10 × 7 000 = 70 000 so'm) va ustozga **ogohlantirish** yuboriladi:
+
+> ⚠️ Siz keragidan ortiq kech qoldingiz. Yana 2 marta shunday holat takrorlansa qattiq chora ko'riladi.
+
+Har bir bunday ogohlantirish yozib boriladi. Uchinchi martadan keyin xabar "qattiq chora ko'riladi" deb o'zgaradi. Ogohlantirishlar admin PDF hisobotida (ham umumiy yakunda, ham alohida ro'yxatda) bonus va jazolar bilan birga ko'rinadi. Ustoz ham "🏅 Bonus va jazolarim" bo'limida o'z ogohlantirishlarini ko'radi.
+
+Bu qiymatlar `config.py` faylida o'zgartiriladi: `EARLY_REQUIRED_MINUTES`, `FINE_EARLY_PER_MINUTE`, `FINE_LATE_PER_MINUTE`, `LATE_FINE_CAP_MINUTES` (10 daqiqalik chegara), `WARNING_STRIKE_LIMIT` (necha marta ogohlantirish = qattiq chora).
 
 ## Bonus va jazolar
 
@@ -98,9 +106,9 @@ Tugmalar o'rniga matnli buyruqlardan ham foydalansa bo'ladi:
 
 ## PDF hisobot ichida nima bo'ladi
 
-1. **Umumiy yakun** — har bir o'qituvchi bo'yicha: kelgan kunlar, kech qolgan kunlar, **jami jarima**, bonus va jazolar soni. Pastida barcha o'qituvchilar bo'yicha umumiy jarima yig'indisi.
-2. **Kunlik davomat** — sana, kelgan vaqt, belgilangan vaqt, erta oynadagi daqiqalar (5 000 so'm/daqiqa), kech qolgan daqiqalar (7 000 so'm/daqiqa) va o'sha kungi **jarima summasi**.
-3. **Bonus va jazolar** — kimga, qachon, qaysi turi va **sababi** bilan.
+1. **Umumiy yakun** — har bir o'qituvchi bo'yicha: kelgan kunlar, kech qolgan kunlar, **jami jarima**, bonus, jazo va ogohlantirishlar soni. Pastida barcha o'qituvchilar bo'yicha umumiy jarima yig'indisi.
+2. **Kunlik davomat** — sana, kelgan vaqt, belgilangan vaqt, erta oynadagi daqiqalar (5 000 so'm/daqiqa), kech qolgan daqiqalar (7 000 so'm/daqiqa, eng ko'pi 10 daqiqagacha) va o'sha kungi **jarima summasi**.
+3. **Bonus, jazo va ogohlantirishlar** — kimga, qachon, qaysi turi va **sababi** bilan.
 
 ## Ishga tushirish
 

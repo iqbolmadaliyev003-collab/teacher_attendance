@@ -54,8 +54,10 @@ from config import (
     FINE_EARLY_PER_MINUTE,
     FINE_LATE_PER_MINUTE,
     GROUP_CHAT_ID,
+    LATE_FINE_CAP_MINUTES,
     RADIUS_METERS,
     TIMEZONE,
+    WARNING_STRIKE_LIMIT,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,6 +260,14 @@ def add_mark(teacher_id: int, mark_type: str, reason: str, admin_id: int):
     )
 
 
+def count_marks(teacher_id: int, mark_type: str) -> int:
+    """O'qituvchining shu turdagi (bonus/jazo/ogohlantirish) yozuvlari soni."""
+    return db(
+        "SELECT COUNT(*) FROM marks WHERE teacher_id = ? AND mark_type = ?",
+        (teacher_id, mark_type), fetch="one",
+    )[0]
+
+
 def get_marks(teacher_id: int, date_from=None, date_to=None):
     """(turi, sabab, sana) ro'yxati — eng yangisi birinchi."""
     query = "SELECT mark_type, reason, mark_date FROM marks WHERE teacher_id = ?"
@@ -313,29 +323,35 @@ def format_money(amount: int) -> str:
     return f"{amount:,}".replace(",", " ") + " so'm"
 
 
-def compute_fine(now: datetime, scheduled_dt: datetime) -> tuple[int, int, int]:
+def compute_fine(now: datetime, scheduled_dt: datetime) -> tuple[int, int, int, bool]:
     """Kelgan vaqtga qarab jarimani hisoblaydi.
-    Qaytaradi: (erta_oyna_daqiqasi, kechikkan_daqiqa, jami_jarima).
+    Qaytaradi: (erta_oyna_daqiqasi, kechikkan_daqiqa, jami_jarima, ortiqcha_kechikish).
 
     Ustoz belgilangan vaqtdan EARLY_REQUIRED_MINUTES daqiqa oldin kelishi kerak:
       • deadline (masalan 08:55) gacha kelsa — jarima yo'q;
       • deadline bilan belgilangan vaqt (08:55–09:00) orasidagi har daqiqa — 5000 so'm;
       • belgilangan vaqtdan (09:00) keyingi har daqiqa — 7000 so'm.
+    Belgilangan vaqtdan LATE_FINE_CAP_MINUTES (10) daqiqadan ortiq kech qolsa,
+    jarima 10 daqiqada TO'XTAYDI va ortiqcha_kechikish=True qaytadi (ogohlantirish uchun).
     30 soniya ham 1 daqiqa deb hisoblanadi (yaxlitlash yuqoriga)."""
     deadline = scheduled_dt - timedelta(minutes=EARLY_REQUIRED_MINUTES)
     if now <= deadline:
-        return 0, 0, 0
+        return 0, 0, 0, False
 
     # Erta kelish oynasi: deadline dan belgilangan vaqtgacha (yoki kelgan vaqtgacha) bo'lgan qism
     early_seconds = (min(now, scheduled_dt) - deadline).total_seconds()
     early_min = ceil(early_seconds / 60) if early_seconds > 0 else 0
 
-    # Belgilangan vaqtdan keyingi qism
+    # Belgilangan vaqtdan keyingi qism (haqiqiy kechikish)
     late_seconds = (now - scheduled_dt).total_seconds()
     late_min = ceil(late_seconds / 60) if late_seconds > 0 else 0
 
-    total = early_min * FINE_EARLY_PER_MINUTE + late_min * FINE_LATE_PER_MINUTE
-    return early_min, late_min, total
+    # Jarima hisoblashda kech qism 10 daqiqada to'xtaydi
+    excessive = late_min > LATE_FINE_CAP_MINUTES
+    charged_late_min = min(late_min, LATE_FINE_CAP_MINUTES)
+
+    total = early_min * FINE_EARLY_PER_MINUTE + charged_late_min * FINE_LATE_PER_MINUTE
+    return early_min, late_min, total, excessive
 
 
 def is_admin(user: User | None) -> bool:
@@ -446,6 +462,7 @@ MARKS_KB = InlineKeyboardMarkup(
     inline_keyboard=[[
         InlineKeyboardButton(text="🏅 Bonuslar", callback_data="my_bonus"),
         InlineKeyboardButton(text="⚠️ Jazolar", callback_data="my_jazo"),
+        InlineKeyboardButton(text="🔔 Ogohlantirishlar", callback_data="my_ogoh"),
     ]]
 )
 
@@ -573,20 +590,42 @@ async def handle_location(message: Message):
     # Shu hafta kuniga belgilangan vaqt (haftalik jadval bo'lsa — o'sha, aks holda standart)
     scheduled_time, leave_time = times_for_day(teacher, now)
 
+    excessive = False
     if scheduled_time is None:
         # Bu kun dam olish kuni deb belgilangan — kechikish/jarima hisoblanmaydi
         early_minutes = late_minutes = fine_amount = 0
     else:
         sched_hour, sched_minute = map(int, scheduled_time.split(":"))
         scheduled_dt = now.replace(hour=sched_hour, minute=sched_minute, second=0, microsecond=0)
-        early_minutes, late_minutes, fine_amount = compute_fine(now, scheduled_dt)
+        early_minutes, late_minutes, fine_amount, excessive = compute_fine(now, scheduled_dt)
 
     is_late = late_minutes > 0
+    # Jarima hisoblangan kech daqiqalar (10 daqiqada to'xtaydi)
+    charged_late = min(late_minutes, LATE_FINE_CAP_MINUTES)
 
     if not record_attendance(teacher_id, arrived, is_late, late_minutes,
                              early_minutes, fine_amount, scheduled_time):
         await message.answer(ALREADY_CHECKED)
         return
+
+    # Ortiqcha kechikish bo'lsa — ogohlantirishni yozib qo'yamiz (admin_id=0: tizim)
+    warning_text = None
+    if excessive:
+        reason = f"Belgilangan vaqtdan {format_minutes(late_minutes)} kech keldi (10 daqiqadan ortiq)"
+        add_mark(teacher_id, "ogohlantirish", reason, 0)
+        strikes = count_marks(teacher_id, "ogohlantirish")  # shu ogohlantirish ham hisobga olindi
+        remaining = WARNING_STRIKE_LIMIT - strikes
+        warning_text = (
+            "⚠️ <b>Ogohlantirish!</b>\n"
+            "Siz keragidan ortiq (10 daqiqadan ko'p) kech qoldingiz.\n"
+        )
+        if remaining > 0:
+            warning_text += f"Yana {remaining} marta shunday holat takrorlansa qattiq chora ko'riladi."
+        else:
+            warning_text += (
+                f"Bu — {strikes}-ogohlantirish. Chegara ({WARNING_STRIKE_LIMIT}) dan oshdi, "
+                "qattiq chora ko'riladi!"
+            )
 
     # Guruhga yuboriladigan xabar
     group_text = f"👤 {first_name} {last_name}\n🕒 Kelgan vaqti: {arrived}\n"
@@ -602,11 +641,14 @@ async def handle_location(message: Message):
                 f"→ {format_money(early_minutes * FINE_EARLY_PER_MINUTE)}\n"
             )
         if late_minutes:
+            cap_note = " (10 daqiqada to'xtatildi)" if excessive else ""
             group_text += (
-                f"🔴 Belgilangan vaqtdan {format_minutes(late_minutes)} kech qoldi "
-                f"→ {format_money(late_minutes * FINE_LATE_PER_MINUTE)}\n"
+                f"🔴 Belgilangan vaqtdan {format_minutes(late_minutes)} kech qoldi{cap_note} "
+                f"→ {format_money(charged_late * FINE_LATE_PER_MINUTE)}\n"
             )
         group_text += f"💰 Jami jarima: <b>{format_money(fine_amount)}</b>"
+        if excessive:
+            group_text += "\n⚠️ Keragidan ortiq kech qoldi — ogohlantirish berildi."
 
     try:
         await message.bot.send_message(GROUP_CHAT_ID, group_text)
@@ -619,6 +661,10 @@ async def handle_location(message: Message):
     if leave_time:
         reply += f"\n🕕 Markazdan ketish vaqtingiz: <b>{leave_time}</b>"
     await message.answer(reply, reply_markup=menu_kb(message.from_user))
+
+    # Ogohlantirishni alohida xabar qilib yuboramiz (ustoz e'tibor bersin)
+    if warning_text:
+        await message.answer(warning_text)
 
 
 @teacher_router.message(F.text == "📊 Statistikam")
@@ -694,31 +740,37 @@ async def handle_my_marks(message: Message):
 
     marks = get_marks(teacher[0])
     bonus_count = sum(1 for mark_type, _, _ in marks if mark_type == "bonus")
-    jazo_count = len(marks) - bonus_count
+    jazo_count = sum(1 for mark_type, _, _ in marks if mark_type == "jazo")
+    ogoh_count = sum(1 for mark_type, _, _ in marks if mark_type == "ogohlantirish")
 
     await message.answer(
         f"🏅 Jami bonuslar: <b>{bonus_count}</b> ta\n"
-        f"⚠️ Jami jazolar: <b>{jazo_count}</b> ta\n\n"
+        f"⚠️ Jami jazolar: <b>{jazo_count}</b> ta\n"
+        f"🔔 Ogohlantirishlar: <b>{ogoh_count}</b> ta\n\n"
         "Batafsil ko'rish uchun tugmani bosing:",
         reply_markup=MARKS_KB,
     )
 
 
-@teacher_router.callback_query(F.data.in_({"my_bonus", "my_jazo"}))
+@teacher_router.callback_query(F.data.in_({"my_bonus", "my_jazo", "my_ogoh"}))
 async def handle_my_marks_detail(callback: CallbackQuery):
     teacher = get_teacher(callback.from_user.id)
     if not teacher:
         await callback.answer("Siz ro'yxatdan o'tmagansiz.", show_alert=True)
         return
 
-    wanted = "bonus" if callback.data == "my_bonus" else "jazo"
-    title = "🏅 Bonuslaringiz" if wanted == "bonus" else "⚠️ Jazolaringiz"
+    wanted = {"my_bonus": "bonus", "my_jazo": "jazo", "my_ogoh": "ogohlantirish"}[callback.data]
+    title = {
+        "bonus": "🏅 Bonuslaringiz",
+        "jazo": "⚠️ Jazolaringiz",
+        "ogohlantirish": "🔔 Ogohlantirishlaringiz",
+    }[wanted]
     rows = [(reason, date) for mark_type, reason, date in get_marks(teacher[0])
             if mark_type == wanted]
 
     if not rows:
         text = f"{title}\n\nHozircha bunday yozuv yo'q."
-        if wanted == "jazo":
+        if wanted != "bonus":
             text += " Shunday davom eting! 🎉"
     else:
         text = f"{title} — jami {len(rows)} ta:\n\n" + "\n".join(
@@ -1389,7 +1441,8 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
 
     # ---- 1-jadval: har bir o'qituvchi bo'yicha yakun ----
     def new_item():
-        return {"days": 0, "late": 0, "minutes": 0, "fine": 0, "bonus": 0, "jazo": 0}
+        return {"days": 0, "late": 0, "minutes": 0, "fine": 0,
+                "bonus": 0, "jazo": 0, "ogohlantirish": 0}
 
     summary: dict[str, dict] = {}
     for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine in records:
@@ -1409,15 +1462,15 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     pdf.cell(0, 8, safe("1. Umumiy yakun"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     table(
-        ["O'qituvchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo"],
+        ["O'qituvchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo", "Ogoh."],
         [
             [name, item["days"], item["late"],
              format_money(item["fine"]) if item["fine"] else "-",
-             item["bonus"], item["jazo"]]
+             item["bonus"], item["jazo"], item["ogohlantirish"]]
             for name, item in sorted(summary.items())
         ],
-        widths=(52, 22, 24, 46, 18, 18),
-        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER"),
+        widths=(46, 20, 22, 42, 16, 16, 18),
+        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER", "CENTER"),
     )
     pdf.ln(2)
     pdf.set_font(font, "B", 10)
@@ -1431,7 +1484,8 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     pdf.set_font(font, "", 8)
     pdf.cell(0, 5, safe(
         f"Erta kelish oynasi: har daqiqa {format_money(FINE_EARLY_PER_MINUTE)}  |  "
-        f"Belgilangan vaqtdan keyin: har daqiqa {format_money(FINE_LATE_PER_MINUTE)}"),
+        f"Belgilangan vaqtdan keyin: har daqiqa {format_money(FINE_LATE_PER_MINUTE)} "
+        f"(eng ko'pi {LATE_FINE_CAP_MINUTES} daqiqagacha, undan ortig'iga ogohlantirish)"),
         new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     if records:
@@ -1452,23 +1506,24 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(6)
 
-    # ---- 3-jadval: bonus va jazolar, sabablari bilan ----
+    # ---- 3-jadval: bonus, jazo va ogohlantirishlar, sabablari bilan ----
+    type_label = {"bonus": "BONUS", "jazo": "JAZO", "ogohlantirish": "OGOHLANTIRISH"}
     pdf.set_font(font, "B", 12)
-    pdf.cell(0, 8, safe("3. Bonus va jazolar"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 8, safe("3. Bonus, jazo va ogohlantirishlar"),
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     if marks:
         table(
             ["O'qituvchi", "Sana", "Turi", "Sababi"],
             [
-                [f"{first} {last}", date,
-                 "BONUS" if mark_type == "bonus" else "JAZO", reason]
+                [f"{first} {last}", date, type_label.get(mark_type, mark_type.upper()), reason]
                 for first, last, mark_type, reason, date in marks
             ],
-            widths=(42, 22, 20, 96),
+            widths=(40, 22, 30, 88),
             aligns=("LEFT", "CENTER", "CENTER", "LEFT"),
         )
     else:
-        pdf.cell(0, 6, safe("Bu davrda bonus yoki jazo berilmagan."),
+        pdf.cell(0, 6, safe("Bu davrda bonus, jazo yoki ogohlantirish berilmagan."),
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     return bytes(pdf.output())
@@ -1508,6 +1563,8 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
 
     pdf_bytes = build_report_pdf(records, marks, date_from, date_to)
     bonus_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "bonus")
+    jazo_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "jazo")
+    ogoh_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "ogohlantirish")
     total_fine = sum(row[8] for row in records)
 
     await message.answer_document(
@@ -1520,7 +1577,7 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
             f"Davr: {date_from.isoformat()} — {date_to.isoformat()}\n"
             f"📊 Davomat yozuvlari: {len(records)}\n"
             f"💰 Jami jarima: {format_money(total_fine)}\n"
-            f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {len(marks) - bonus_count}"
+            f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {jazo_count}   🔔 Ogohlantirishlar: {ogoh_count}"
         ),
     )
 
