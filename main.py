@@ -434,12 +434,6 @@ CANCEL_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-LOCATION_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📍 Lokatsiyani yuborish", request_location=True)]],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
-
 STATS_KB = InlineKeyboardMarkup(
     inline_keyboard=[[
         InlineKeyboardButton(text="📅 Bugun", callback_data="stats_day"),
@@ -545,7 +539,11 @@ async def handle_keldim(message: Message):
         await message.answer(ALREADY_CHECKED)
         return
 
-    await message.answer("Iltimos, joriy lokatsiyangizni yuboring 👇", reply_markup=LOCATION_KB)
+    await message.answer(
+        "Iltimos, joriy lokatsiyangizni o'zingiz yuboring 👇\n\n"
+        "📎 belgisini bosing → <b>Location</b> (Joylashuv) → "
+        "<b>Send My Current Location</b>."
+    )
 
 
 @teacher_router.message(F.location)
@@ -565,9 +563,9 @@ async def handle_location(message: Message):
     if message.forward_origin is not None:
         await message.answer(
             "❌ Forward qilingan lokatsiya qabul qilinmaydi.\n"
-            "Iltimos, \"📍 Lokatsiyani yuborish\" tugmasi orqali joriy "
-            "lokatsiyangizni yuboring.",
-            reply_markup=LOCATION_KB,
+            "Iltimos, 📎 belgisi orqali <b>Location</b> dan joriy "
+            "lokatsiyangizni o'zingiz yuborib, qayta urinib ko'ring.",
+            reply_markup=menu_kb(message.from_user),
         )
         return
 
@@ -654,6 +652,31 @@ async def handle_location(message: Message):
         await message.bot.send_message(GROUP_CHAT_ID, group_text)
     except TelegramAPIError:
         logger.exception("Guruhga (%s) xabar yuborib bo'lmadi", GROUP_CHAT_ID)
+
+    # Har bir adminga alohida — aniq lokatsiya (xarita nuqtasi) + qisqacha xabar:
+    # ism-familiya, kelgan vaqt va (agar kech qolgan bo'lsa) necha daqiqa kechikkani
+    if scheduled_time is None:
+        admin_status = "🌙 Bugun dam olish kuni sifatida belgilangan"
+    elif is_late:
+        admin_status = f"🔴 Kech qoldi: {format_minutes(late_minutes)}"
+    elif fine_amount:
+        admin_status = f"🟡 Erta kelish oynasida {early_minutes} daqiqa kechikdi"
+    else:
+        admin_status = "🟢 Vaqtida keldi"
+    admin_text = (
+        f"📍 <b>Yangi kelish</b>\n"
+        f"👤 {first_name} {last_name}\n"
+        f"🕒 Kelgan vaqti: {arrived}\n"
+        f"{admin_status}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.bot.send_location(
+                admin_id, message.location.latitude, message.location.longitude
+            )
+            await message.bot.send_message(admin_id, admin_text)
+        except TelegramAPIError:
+            logger.exception("Adminga (%s) xabar yuborib bo'lmadi", admin_id)
 
     reply = "✅ Kelganingiz muvaffaqiyatli qayd etildi. Rahmat!"
     if fine_amount:
