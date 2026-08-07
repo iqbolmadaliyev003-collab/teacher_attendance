@@ -67,6 +67,11 @@ TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 ALREADY_CHECKED = "Siz bugun allaqachon kelganingizni belgilagansiz. ✅"
+ALREADY_LEFT = "Siz bugun allaqachon ish tugatganingizni belgilagansiz. 🏁"
+NOT_CHECKED_IN = (
+    "Siz bugun hali kelganingizni belgilamagansiz.\n"
+    "Avval \"✅ Keldim\" tugmasini bosing."
+)
 
 # Hafta kunlari — Python'ning weekday() tartibida: 0 = dushanba ... 6 = yakshanba
 WEEKDAYS = [
@@ -122,6 +127,7 @@ def init_db():
                 early_minutes INTEGER NOT NULL DEFAULT 0,-- deadline bilan belgilangan vaqt orasidagi daqiqalar (5000)
                 fine_amount INTEGER NOT NULL DEFAULT 0,  -- jami jarima (so'mda)
                 scheduled_time TEXT,                     -- o'sha kunga amal qilgan belgilangan vaqt
+                left_time TEXT,                          -- ish tugatilgan (ketgan) vaqt 'HH:MM:SS' yoki NULL
                 FOREIGN KEY (teacher_id) REFERENCES teachers (id)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_teacher_date
@@ -172,6 +178,8 @@ def init_db():
             conn.execute("ALTER TABLE attendance ADD COLUMN early_minutes INTEGER NOT NULL DEFAULT 0")
         if "fine_amount" not in attendance_columns:
             conn.execute("ALTER TABLE attendance ADD COLUMN fine_amount INTEGER NOT NULL DEFAULT 0")
+        if "left_time" not in attendance_columns:
+            conn.execute("ALTER TABLE attendance ADD COLUMN left_time TEXT")
         conn.commit()
 
 
@@ -300,6 +308,25 @@ def has_checked_in_today(teacher_id: int) -> bool:
     ) is not None
 
 
+def has_checked_out_today(teacher_id: int) -> bool:
+    """Bugun ish tugatilgani (ketgan vaqt yozilgani) belgilanganmi."""
+    row = db(
+        "SELECT left_time FROM attendance WHERE teacher_id = ? AND attendance_date = ?",
+        (teacher_id, today()), fetch="one",
+    )
+    return row is not None and row[0] is not None
+
+
+def record_checkout(teacher_id: int, left_time: str) -> bool:
+    """Bugungi davomat yozuviga ketish vaqtini yozadi.
+    Yozuv topilmasa yoki allaqachon ketgan bo'lsa False qaytaradi."""
+    return db(
+        "UPDATE attendance SET left_time = ? "
+        "WHERE teacher_id = ? AND attendance_date = ? AND left_time IS NULL",
+        (left_time, teacher_id, today()),
+    ) > 0
+
+
 # ==================== 2. YORDAMCHI FUNKSIYALAR ====================
 
 def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -397,7 +424,10 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
     o'qituvchiga — Keldim/Statistika, adminga — boshqaruv tugmalari."""
     rows = []
     if get_teacher(user.id):
-        rows.append([KeyboardButton(text="✅ Keldim")])
+        rows.append([
+            KeyboardButton(text="✅ Keldim"),
+            KeyboardButton(text="🏁 Tugatdim"),
+        ])
         rows.append([
             KeyboardButton(text="📊 Statistikam"),
             KeyboardButton(text="🏅 Bonus va jazolarim"),
@@ -540,9 +570,11 @@ async def handle_keldim(message: Message):
         return
 
     await message.answer(
-        "Iltimos, joriy lokatsiyangizni o'zingiz yuboring 👇\n\n"
+        "Iltimos, <b>jonli joylashuvingizni</b> (live location) yuboring 👇\n\n"
         "📎 belgisini bosing → <b>Location</b> (Joylashuv) → "
-        "<b>Send My Current Location</b>."
+        "<b>Share My Live Location</b> (Jonli joylashuvni ulashish).\n\n"
+        "⚠️ Xaritada nuqta belgilab yuborilgan oddiy joylashuv qabul qilinmaydi — "
+        "faqat jonli joylashuv qabul qilinadi."
     )
 
 
@@ -563,8 +595,22 @@ async def handle_location(message: Message):
     if message.forward_origin is not None:
         await message.answer(
             "❌ Forward qilingan lokatsiya qabul qilinmaydi.\n"
-            "Iltimos, 📎 belgisi orqali <b>Location</b> dan joriy "
-            "lokatsiyangizni o'zingiz yuborib, qayta urinib ko'ring.",
+            "Iltimos, 📎 belgisi orqali <b>Location</b> dan <b>jonli</b> "
+            "joylashuvingizni o'zingiz yuborib, qayta urinib ko'ring.",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return
+
+    # Faqat JONLI joylashuv (live location) qabul qilinadi.
+    # Oddiy joylashuvda foydalanuvchi xaritada istalgan nuqtani (masalan, markazni)
+    # qo'lda belgilab yuborishi mumkin — bu firibgarlikka yo'l ochadi.
+    # Jonli joylashuv esa qurilmaning haqiqiy GPS'idan real vaqtda olinadi.
+    if message.location.live_period is None:
+        await message.answer(
+            "❌ Oddiy (xaritada belgilangan) joylashuv qabul qilinmaydi.\n\n"
+            "Iltimos, <b>jonli joylashuv</b> yuboring:\n"
+            "📎 → <b>Location</b> → <b>Share My Live Location</b> "
+            "(Jonli joylashuvni ulashish).",
             reply_markup=menu_kb(message.from_user),
         )
         return
@@ -683,11 +729,89 @@ async def handle_location(message: Message):
         reply += f"\n💰 Bugungi jarima: <b>{format_money(fine_amount)}</b>"
     if leave_time:
         reply += f"\n🕕 Markazdan ketish vaqtingiz: <b>{leave_time}</b>"
+    reply += "\n\n🏁 Ish tugagach \"Tugatdim\" tugmasini bosishni unutmang."
     await message.answer(reply, reply_markup=menu_kb(message.from_user))
 
     # Ogohlantirishni alohida xabar qilib yuboramiz (ustoz e'tibor bersin)
     if warning_text:
         await message.answer(warning_text)
+
+
+@teacher_router.message(F.text == "🏁 Tugatdim")
+async def handle_tugatdim(message: Message):
+    """O'qituvchi ish kunini tugatganda bosadi — ketgan vaqti yoziladi,
+    admin va guruhga xabar boradi, hisobotga tushadi."""
+    teacher = get_teacher(message.from_user.id)
+    if not teacher:
+        await message.answer(not_registered_text(message.from_user.id))
+        return
+
+    teacher_id, first_name, last_name = teacher[0], teacher[2], teacher[3]
+
+    # Avval kelgan bo'lishi kerak — aks holda yangilanadigan yozuv yo'q
+    if not has_checked_in_today(teacher_id):
+        await message.answer(NOT_CHECKED_IN)
+        return
+
+    if has_checked_out_today(teacher_id):
+        await message.answer(ALREADY_LEFT)
+        return
+
+    now = datetime.now(TZ)
+    left = now.strftime("%H:%M:%S")
+
+    # Shu kunga belgilangan ketish vaqti (haftalik jadval bo'lsa — o'sha)
+    _arrive_time, leave_time = times_for_day(teacher, now)
+
+    # Belgilangan vaqtdan oldin ketdimi?
+    left_early = False
+    early_minutes = 0
+    if leave_time:
+        leave_hour, leave_minute = map(int, leave_time.split(":"))
+        leave_dt = now.replace(hour=leave_hour, minute=leave_minute, second=0, microsecond=0)
+        if now < leave_dt:
+            left_early = True
+            early_minutes = ceil((leave_dt - now).total_seconds() / 60)
+
+    if not record_checkout(teacher_id, left):
+        await message.answer(ALREADY_LEFT)
+        return
+
+    # O'qituvchiga javob
+    reply = f"🏁 Ish tugatildi. Ketgan vaqtingiz: <b>{left}</b>."
+    if left_early:
+        reply += (
+            f"\n⚠️ Belgilangan ketish vaqti ({leave_time}) dan "
+            f"{format_minutes(early_minutes)} oldin ketdingiz."
+        )
+    await message.answer(reply, reply_markup=menu_kb(message.from_user))
+
+    # Guruh va adminlarga xabar
+    if leave_time is None:
+        status = "🌙 Bugun dam olish kuni sifatida belgilangan"
+    elif left_early:
+        status = (
+            f"🕕 Belgilangan ketish vaqti: {leave_time}\n"
+            f"🟡 Belgilangan vaqtdan {format_minutes(early_minutes)} oldin ketdi"
+        )
+    else:
+        status = f"🕕 Belgilangan ketish vaqti: {leave_time}\n🟢 O'z vaqtida ketdi"
+
+    notice = (
+        f"🏁 <b>Ish tugatildi (ketdi)</b>\n"
+        f"👤 {first_name} {last_name}\n"
+        f"🕒 Ketgan vaqti: {left}\n"
+        f"{status}"
+    )
+    try:
+        await message.bot.send_message(GROUP_CHAT_ID, notice)
+    except TelegramAPIError:
+        logger.exception("Guruhga (%s) ketish xabari yuborilmadi", GROUP_CHAT_ID)
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.bot.send_message(admin_id, notice)
+        except TelegramAPIError:
+            logger.exception("Adminga (%s) ketish xabari yuborilmadi", admin_id)
 
 
 @teacher_router.message(F.text == "📊 Statistikam")
@@ -1468,7 +1592,7 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
                 "bonus": 0, "jazo": 0, "ogohlantirish": 0}
 
     summary: dict[str, dict] = {}
-    for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine in records:
+    for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine, _left in records:
         item = summary.setdefault(f"{first} {last}", new_item())
         item["days"] += 1
         item["fine"] += fine
@@ -1513,15 +1637,15 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     pdf.set_font(font, "", 9)
     if records:
         table(
-            ["O'qituvchi", "Sana", "Kelgan", "Belg.", "Erta daq.", "Kech daq.", "Jarima"],
+            ["O'qituvchi", "Sana", "Kelgan", "Ketgan", "Belg.", "Kech daq.", "Jarima"],
             [
-                [f"{first} {last}", date, arrived, sched or "-",
-                 str(early) if early else "-",
+                [f"{first} {last}", date, arrived, left or "-", sched or "-",
                  str(late_min) if late_min else "-",
                  format_money(fine) if fine else "-"]
-                for first, last, date, arrived, sched, is_late, late_min, early, fine in records
+                for first, last, date, arrived, sched, _is_late, late_min, _early, fine, left
+                in records
             ],
-            widths=(42, 24, 22, 18, 20, 20, 34),
+            widths=(40, 22, 22, 22, 16, 20, 34),
             aligns=("LEFT", "CENTER", "CENTER", "CENTER", "CENTER", "CENTER", "RIGHT"),
         )
     else:
@@ -1558,7 +1682,7 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
         """
         SELECT t.first_name, t.last_name, a.attendance_date, a.arrived_time,
                COALESCE(a.scheduled_time, t.scheduled_time), a.is_late, a.late_minutes,
-               a.early_minutes, a.fine_amount
+               a.early_minutes, a.fine_amount, a.left_time
         FROM attendance a
         JOIN teachers t ON t.id = a.teacher_id
         WHERE a.attendance_date BETWEEN ? AND ?
