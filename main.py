@@ -53,6 +53,7 @@ from config import (
     EARLY_REQUIRED_MINUTES,
     FINE_EARLY_PER_MINUTE,
     FINE_LATE_PER_MINUTE,
+    GPS_ACCURACY_TOLERANCE_METERS,
     GROUP_CHAT_ID,
     LATE_FINE_CAP_MINUTES,
     RADIUS_METERS,
@@ -158,6 +159,13 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_marks_teacher_date
                 ON marks (teacher_id, mark_date);
+
+            -- Botdan turib o'zgartiriladigan sozlamalar (markaz koordinatasi, radius).
+            -- Qator bo'lmasa — config.py dagi qiymat ishlatiladi.
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         # Eski bazalarda bu ustunlar yo'q edi — bor bo'lmasa qo'shamiz
@@ -186,6 +194,36 @@ def init_db():
 def today() -> str:
     """Joriy sana — config'dagi vaqt zonasi bo'yicha (server UTC bo'lsa ham to'g'ri)."""
     return datetime.now(TZ).date().isoformat()
+
+
+# ---------- Sozlamalar (markaz koordinatasi, radius) ----------
+
+def get_setting(key: str) -> str | None:
+    row = db("SELECT value FROM settings WHERE key = ?", (key,), fetch="one")
+    return row[0] if row else None
+
+
+def set_setting(key: str, value) -> None:
+    db(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+
+
+def get_center() -> tuple[float, float]:
+    """O'quv markazning joriy koordinatasi. Admin botdan o'zgartirgan bo'lsa —
+    bazadagi qiymat, aks holda config.py dagi boshlang'ich qiymat."""
+    lat, lon = get_setting("center_lat"), get_setting("center_lon")
+    if lat is None or lon is None:
+        return CENTER_LATITUDE, CENTER_LONGITUDE
+    return float(lat), float(lon)
+
+
+def get_radius() -> int:
+    """Ruxsat etilgan radius (metr) — admin o'zgartirgan bo'lsa, o'sha."""
+    value = get_setting("radius_meters")
+    return int(value) if value else RADIUS_METERS
 
 
 def get_teacher(telegram_id: int):
@@ -339,6 +377,27 @@ def distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return 6371000 * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
+def location_check(location) -> tuple[float, float, float]:
+    """Yuborilgan joylashuvni markaz bilan solishtiradi.
+
+    Qaytaradi: (haqiqiy masofa, GPS xatoligi uchun berilgan yon berish,
+                hisobga olinadigan masofa).
+
+    Nega yon berish kerak: bino ichida telefon sun'iy yo'ldoshni ko'rmaydi va
+    joylashuvni Wi-Fi/uyali tarmoq bo'yicha taxminlaydi. Telegram bunday
+    joylashuv bilan birga "horizontal_accuracy" (xatolik radiusi) ni yuboradi —
+    u 100-500 metr bo'lishi mumkin. Shu xatolikni hisobga olmasak, markazda
+    o'tirgan ustoz ham "uzoqdasiz" degan javob oladi.
+    """
+    center_lat, center_lon = get_center()
+    real = distance_meters(
+        location.latitude, location.longitude, center_lat, center_lon
+    )
+    accuracy = location.horizontal_accuracy or 0
+    tolerance = min(accuracy, GPS_ACCURACY_TOLERANCE_METERS)
+    return real, tolerance, max(real - tolerance, 0)
+
+
 def format_minutes(total_minutes: int) -> str:
     """123 -> '2 soat 3 daqiqa', 45 -> '45 daqiqa'."""
     hours, minutes = divmod(total_minutes, 60)
@@ -441,7 +500,10 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
             KeyboardButton(text="🏅 Bonus berish"),
             KeyboardButton(text="⚠️ Jazo berish"),
         ])
-        rows.append([KeyboardButton(text="📄 PDF hisobot")])
+        rows.append([
+            KeyboardButton(text="📄 PDF hisobot"),
+            KeyboardButton(text="📍 Markaz joylashuvi"),
+        ])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True) if rows else None
 
 
@@ -615,16 +677,31 @@ async def handle_location(message: Message):
         )
         return
 
-    dist = distance_meters(
-        message.location.latitude, message.location.longitude,
-        CENTER_LATITUDE, CENTER_LONGITUDE,
-    )
-    if dist > RADIUS_METERS:
-        await message.answer(
+    real_dist, tolerance, dist = location_check(message.location)
+    radius = get_radius()
+    if dist > radius:
+        text = (
             "❌ Siz hali o'quv markazga yetib kelmagansiz.\n"
-            f"Markazgacha bo'lgan masofa: taxminan {int(dist)} metr.\n"
-            "Markazga yetib kelganingizdan so'ng qaytadan urinib ko'ring.",
-            reply_markup=menu_kb(message.from_user),
+            f"Markazgacha bo'lgan masofa: taxminan {int(real_dist)} metr "
+            f"(ruxsat etilgan: {radius} metr).\n"
+        )
+        if tolerance:
+            text += f"📡 GPS xatoligi hisobga olindi: −{int(tolerance)} metr.\n"
+        text += (
+            "\n💡 <b>Agar siz markazda bo'lsangiz:</b>\n"
+            "• Telefon sozlamalarida joylashuv aniqligini yoqing "
+            "(Location → <b>High accuracy</b> / <b>Aniq joylashuv</b>).\n"
+            "• Wi-Fi'ni yoqib qo'ying — bino ichida aniqlikni oshiradi.\n"
+            "• Deraza yoniga yoki tashqariga chiqib, 10-20 soniya kutib qayta yuboring.\n"
+            "• Baribir yordam bermasa — adminga murojaat qiling, "
+            "u markaz nuqtasini qaytadan belgilab beradi."
+        )
+        await message.answer(text, reply_markup=menu_kb(message.from_user))
+        logger.info(
+            "Lokatsiya rad etildi: teacher_id=%s, masofa=%.0fm, xatolik=%.0fm, "
+            "koordinata=%s,%s",
+            teacher_id, real_dist, message.location.horizontal_accuracy or 0,
+            message.location.latitude, message.location.longitude,
         )
         return
 
@@ -964,6 +1041,11 @@ class EditSchedule(StatesGroup):
     picking = State()   # kunlarni belgilash
     arrive = State()    # kelish vaqtini kiritish
     leave = State()     # ketish vaqtini kiritish
+
+
+class SetCenter(StatesGroup):
+    location = State()  # markazning yangi nuqtasi
+    radius = State()    # ruxsat etilgan radius
 
 
 @panel_router.message(F.text == "❌ Bekor qilish")
@@ -1506,6 +1588,118 @@ async def jazo_save_custom(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     await save_and_notify_mark(message, message.from_user, data["tg_id"], "jazo", reason)
+
+
+# ---------- Markaz joylashuvi va radius ----------
+# Ustozlar "juda uzoqdasiz" degan javob olayotgan bo'lsa, ko'pincha sabab —
+# config.py dagi koordinata bino ustiga aniq tushmagan. Admin markaz ichida
+# turib jonli joylashuv yuborsa, nuqta shu yerga ko'chadi.
+
+CENTER_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Yangi markazni belgilash", callback_data="center_set")],
+        [InlineKeyboardButton(text="📏 Radiusni o'zgartirish", callback_data="center_radius")],
+    ]
+)
+
+
+@panel_router.message(F.text == "📍 Markaz joylashuvi")
+async def center_menu(message: Message):
+    lat, lon = get_center()
+    is_custom = get_setting("center_lat") is not None
+    await message.bot.send_location(message.chat.id, lat, lon)
+    await message.answer(
+        "📍 <b>O'quv markazning hozirgi nuqtasi</b>\n"
+        f"Koordinata: <code>{lat}, {lon}</code>\n"
+        f"Manba: {'botdan belgilangan' if is_custom else 'config.py (boshlang`ich)'}\n"
+        f"Ruxsat etilgan radius: <b>{get_radius()} metr</b>\n"
+        f"GPS xatoligiga yon berish: {GPS_ACCURACY_TOLERANCE_METERS} metrgacha\n\n"
+        "Yuqoridagi xarita nuqtasi o'quv markaz binosiga to'g'ri kelmasa — "
+        "uni qaytadan belgilang.",
+        reply_markup=CENTER_KB,
+    )
+
+
+@panel_router.callback_query(F.data == "center_set")
+async def center_set_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SetCenter.location)
+    await callback.message.answer(
+        "🎯 <b>Markaz nuqtasini belgilash</b>\n\n"
+        "O'quv markaz <b>ichida yoki hovlisida turib</b> jonli joylashuvingizni yuboring:\n"
+        "📎 → <b>Location</b> → <b>Share My Live Location</b>\n\n"
+        "⚠️ Aniqroq bo'lishi uchun: Wi-Fi yoqilgan bo'lsin va imkon bo'lsa "
+        "deraza yonida yoki tashqarida turing.",
+        reply_markup=CANCEL_KB,
+    )
+    await callback.answer()
+
+
+@panel_router.message(SetCenter.location, F.location)
+async def center_set_save(message: Message, state: FSMContext):
+    lat, lon = message.location.latitude, message.location.longitude
+    accuracy = message.location.horizontal_accuracy or 0
+
+    old_lat, old_lon = get_center()
+    moved = distance_meters(lat, lon, old_lat, old_lon)
+
+    set_setting("center_lat", lat)
+    set_setting("center_lon", lon)
+    await state.clear()
+
+    text = (
+        "✅ <b>Markaz nuqtasi yangilandi.</b>\n"
+        f"Yangi koordinata: <code>{lat}, {lon}</code>\n"
+        f"Eski nuqtadan farqi: {int(moved)} metr\n"
+        f"Ruxsat etilgan radius: {get_radius()} metr"
+    )
+    if accuracy:
+        text += f"\n📡 Yuborilgan joylashuv aniqligi: ±{int(accuracy)} metr"
+        if accuracy > 50:
+            text += (
+                "\n\n⚠️ Aniqlik pastroq. Nuqta biroz siljigan bo'lishi mumkin — "
+                "tashqariga chiqib qayta yuborsangiz aniqroq bo'ladi."
+            )
+    await message.answer(text, reply_markup=menu_kb(message.from_user))
+
+
+@panel_router.message(SetCenter.location)
+async def center_set_wrong_input(message: Message):
+    await message.answer(
+        "Bu joylashuv emas. Iltimos, 📎 → <b>Location</b> orqali joylashuvingizni "
+        "yuboring yoki \"❌ Bekor qilish\" tugmasini bosing.",
+        reply_markup=CANCEL_KB,
+    )
+
+
+@panel_router.callback_query(F.data == "center_radius")
+async def center_radius_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SetCenter.radius)
+    await callback.message.answer(
+        "📏 <b>Radiusni o'zgartirish</b>\n\n"
+        f"Hozirgi radius: <b>{get_radius()} metr</b>\n"
+        "Yangi qiymatni faqat son bilan yozing (masalan: <code>100</code>).\n\n"
+        "💡 Tavsiya: 80-150 metr. Juda kichik radius (50 dan past) bino ichidagi "
+        "GPS xatoligi tufayli ustozlarni noto'g'ri rad etadi.",
+        reply_markup=CANCEL_KB,
+    )
+    await callback.answer()
+
+
+@panel_router.message(SetCenter.radius, F.text)
+async def center_radius_save(message: Message, state: FSMContext):
+    value = message.text.strip()
+    if not value.isdigit() or not 10 <= int(value) <= 5000:
+        await message.answer(
+            "Noto'g'ri qiymat. 10 dan 5000 gacha bo'lgan sonni yuboring (metrlarda)."
+        )
+        return
+
+    set_setting("radius_meters", int(value))
+    await state.clear()
+    await message.answer(
+        f"✅ Radius <b>{value} metr</b> qilib belgilandi.",
+        reply_markup=menu_kb(message.from_user),
+    )
 
 
 # ==================== 7. PDF HISOBOT ====================

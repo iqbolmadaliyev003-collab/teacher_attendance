@@ -8,7 +8,7 @@ O'qituvchilarning markazga qancha vaqt kech kelganini lokatsiya orqali tekshirad
 2. O'qituvchi markazga kelib, "✅ Keldim" tugmasini bosadi.
 3. Bot lokatsiya so'raydi.
 4. O'qituvchi lokatsiyasini yuboradi:
-   - Agar lokatsiya markazdan `RADIUS_METERS` dan uzoqroq bo'lsa → bot "Siz hali markazga yetib kelmagansiz" deb javob beradi, guruhga hech narsa yubormaydi.
+   - Agar lokatsiya markazdan `RADIUS_METERS` dan uzoqroq bo'lsa → bot "Siz hali markazga yetib kelmagansiz" deb javob beradi, guruhga hech narsa yubormaydi. Masofa hisoblanganda telefonning GPS xatoligi hisobga olinadi (pastdagi "Joylashuv aniqligi" bo'limiga qarang).
    - Agar lokatsiya mos tushsa → guruhga ism-familiya va real vaqt bilan xabar yuboriladi. Agar belgilangan vaqtdan kech bo'lsa, necha daqiqa/soat kechikkani ham yoziladi.
 5. Har bir o'qituvchi kuniga faqat bitta marta "keldim" deb belgilashi mumkin.
 6. O'qituvchi istalgan vaqtda "📊 Statistikam" tugmasini bosib, **Bugun / Bu hafta / Bu oy** bo'yicha nechta kun kelgani, nechta marta va jami necha daqiqa/soat kech qolganini ko'rishi mumkin (masalan: "6 marta, jami 30 daqiqa kech qoldingiz").
@@ -70,8 +70,9 @@ BOT_TOKEN=123456789:ABCdef...   # @BotFather'dan olingan o'z tokeningiz
 
 - `GROUP_CHAT_ID` — xabarlar yuboriladigan guruh IDsi (botni guruhga admin qilib qo'shing)
 - `ADMIN_IDS` — o'qituvchi qo'shish huquqiga ega shaxslarning Telegram ID raqamlari (masalan: `{123456789, 987654321}`)
-- `CENTER_LATITUDE`, `CENTER_LONGITUDE` — o'quv markazning lokatsiyasi
-- `RADIUS_METERS` — ruxsat etilgan masofa (metr)
+- `CENTER_LATITUDE`, `CENTER_LONGITUDE` — o'quv markazning lokatsiyasi (**boshlang'ich** qiymat — botdan turib o'zgartirish mumkin)
+- `RADIUS_METERS` — ruxsat etilgan masofa, metr (bu ham botdan o'zgartiriladi)
+- `GPS_ACCURACY_TOLERANCE_METERS` — GPS xatoligiga beriladigan eng katta yon berish (metr)
 - `EARLY_REQUIRED_MINUTES`, `FINE_EARLY_PER_MINUTE`, `FINE_LATE_PER_MINUTE` — jarima sozlamalari
 
 `GROUP_CHAT_ID` va `ADMIN_IDS` ni ham xohlasangiz environment variable orqali o'zgartirish mumkin.
@@ -85,6 +86,23 @@ Admin botga `/start` yozsa, boshqaruv tugmalari chiqadi — hech qanday buyruq y
 - **🏅 Bonus berish** — o'qituvchini tanlaysiz, sababini yozasiz, bot o'qituvchiga xabar yuboradi.
 - **⚠️ Jazo berish** — o'qituvchini tanlaysiz, sababini ro'yxatdan tanlaysiz.
 - **📄 PDF hisobot** — "Shu oy", "O'tgan oy" yoki istalgan davr uchun hisobotni bir bosishda yuklab olish.
+- **📍 Markaz joylashuvi** — hozirgi markaz nuqtasini xaritada ko'rsatadi, uni qaytadan belgilash va radiusni o'zgartirish imkonini beradi.
+
+## Joylashuv aniqligi
+
+Ustozlar markazda o'tirgan bo'lsa ham "siz N metr uzoqdasiz" degan javob olayotgan bo'lsa, sababi ikkitadan biri:
+
+**1. Markaz nuqtasi noto'g'ri belgilangan.** `config.py` dagi koordinata bino ustiga aniq tushmagan bo'lishi mumkin. Tekshirish oson: adminda **📍 Markaz joylashuvi** tugmasini bosing — bot hozirgi nuqtani xaritada ko'rsatadi. Nuqta boshqa joyda bo'lsa, **🎯 Yangi markazni belgilash** ni bosib, markaz ichida turib jonli joylashuvingizni yuboring. Yangi nuqta bazada saqlanadi va `config.py` dagi qiymatdan ustun turadi.
+
+**2. Telefonning GPS xatoligi.** Bino ichida telefon sun'iy yo'ldoshni ko'rmaydi va joylashuvni Wi-Fi/uyali tarmoq bo'yicha taxminlaydi — xatolik 100-300 metrgacha yetadi. Telegram har bir joylashuv bilan birga shu xatolik radiusini (`horizontal_accuracy`) yuboradi, bot esa uni masofadan ayiradi:
+
+```
+hisobga olinadigan masofa = haqiqiy masofa − min(GPS xatoligi, GPS_ACCURACY_TOLERANCE_METERS)
+```
+
+Yon berish `GPS_ACCURACY_TOLERANCE_METERS` (standart 300 m) bilan cheklangan — aks holda soxta GPS dasturi "xatoligim 10 000 metr" deb yozib, uzoqdan ham "keldim" qila olardi.
+
+Ustozlarga aytiladigan maslahat: telefon sozlamalarida joylashuv aniqligini **High accuracy** ga qo'ying va Wi-Fi'ni yoqib qo'ying — bino ichida aniqlik sezilarli oshadi.
 
 **🗓 Haftalik jadval qanday belgilanadi:** kerakli kunlarni bosib belgilaysiz (☑️), so'ng "⏰ Tanlangan kunlarga vaqt belgilash" tugmasini bosib kelish va ketish vaqtini kiritasiz. "🌙 Tanlangan kunlar — dam olish" belgilangan kunlarni dam olish kuniga aylantiradi, "🗑 Jadvalni tozalash" esa standart vaqtga qaytaradi.
 
