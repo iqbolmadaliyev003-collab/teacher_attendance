@@ -14,6 +14,30 @@ O'qituvchilarning markazga qancha vaqt kech kelganini lokatsiya orqali tekshirad
 6. O'qituvchi istalgan vaqtda "📊 Statistikam" tugmasini bosib, **Bugun / Bu hafta / Bu oy** bo'yicha nechta kun kelgani, nechta marta va jami necha daqiqa/soat kech qolganini ko'rishi mumkin (masalan: "6 marta, jami 30 daqiqa kech qoldingiz").
 7. "🏅 Bonus va jazolarim" tugmasi orqali o'qituvchi o'ziga nechta bonus va nechta jazo berilganini, har birining sababi va sanasi bilan ko'radi.
 
+## O'qituvchi turlari
+
+Har bir o'qituvchi ikki turdan biri bo'ladi. Turi qo'shishning oxirgi qadamida tanlanadi va keyin ham "📋 O'qituvchilar ro'yxati" dagi **🎭 Turi** tugmasi bilan almashtiriladi.
+
+| | 👨‍🏫 Oddiy o'qituvchi | 🎓 Support teacher |
+|---|---|---|
+| Keldim / Tugatdim | ✅ | ✅ (bir xil) |
+| Kechikish va jarima | ✅ | ✅ (bir xil) |
+| Student bilan seans yozish | — | ✅ |
+
+Oddiy o'qituvchida hech narsa o'zgarmagan. Support teacher esa shu ustiga seans yozib boradi.
+
+### Support teacher seansi
+
+Tasodifiy student support teacher oldiga kelib, tushunmagan mavzusini aytadi:
+
+1. Support teacher **"▶️ Seans boshlash"** tugmasini bosadi — bot boshlanish vaqtini yozib qo'yadi.
+2. Mavzuni tushuntiradi.
+3. **"🏁 Seansni tugatdim"** tugmasini bosadi. Bot davomiylikni ikki tugma orasidagi vaqtdan **o'zi hisoblaydi** — teacher qo'lda vaqt yozmaydi.
+4. Bot 4 ta savol beradi: **student ismi → level → mavzu (theme) → qo'shimcha ma'lumot**. Qo'shimcha ma'lumot shart emas — `-` yuborilsa bo'sh qoladi.
+5. Yozuv saqlanadi, adminlarga darhol xabar boradi va PDF hisobotga tushadi.
+
+Anketa to'ldirilmasdan tashlab ketilsa (**"❌ Seansni bekor qilish"** yoki bot qayta ishga tushsa), yarim yozuv hisobotga tushmaydi. Bot qayta ishga tushganda to'ldirilmagan anketa esga solinadi va o'sha joydan davom etadi.
+
 ## Haftalik jadval
 
 Har bir o'qituvchiga hafta kunlari bo'yicha alohida kelish va ketish vaqti belgilanishi mumkin — masalan dushanba/chorshanba/juma soat 12:00, seshanba/payshanba/shanba soat 13:00, yakshanba esa dam olish kuni.
@@ -81,8 +105,8 @@ BOT_TOKEN=123456789:ABCdef...   # @BotFather'dan olingan o'z tokeningiz
 
 Admin botga `/start` yozsa, boshqaruv tugmalari chiqadi — hech qanday buyruq yodlash shart emas:
 
-- **➕ O'qituvchi qo'shish** — bot 5 qadamda hamma narsani o'zi so'raydi: ID, ism, familiya, kelish vaqti, ketish vaqti. O'qituvchining xabarini forward qilsangiz, ID avtomatik olinadi.
-- **📋 O'qituvchilar ro'yxati** — har bir o'qituvchi yonida ⏰ (kelish/ketish vaqtini o'zgartirish), 🗓 (haftalik jadval) va 🗑 (o'chirish, tasdiq bilan) tugmalari bo'ladi.
+- **➕ O'qituvchi qo'shish** — bot 6 qadamda hamma narsani o'zi so'raydi: ID, ism, familiya, kelish vaqti, ketish vaqti va **turi** (oddiy yoki support). O'qituvchining xabarini forward qilsangiz, ID avtomatik olinadi.
+- **📋 O'qituvchilar ro'yxati** — har bir o'qituvchi yonida ⏰ (kelish/ketish vaqtini o'zgartirish), 🗓 (haftalik jadval), 🎭 (turini almashtirish) va 🗑 (o'chirish, tasdiq bilan) tugmalari bo'ladi. Nom oldidagi belgi turini bildiradi: 🎓 support, 👨‍🏫 oddiy.
 - **🏅 Bonus berish** — o'qituvchini tanlaysiz, sababini yozasiz, bot o'qituvchiga xabar yuboradi.
 - **⚠️ Jazo berish** — o'qituvchini tanlaysiz, sababini ro'yxatdan tanlaysiz.
 - **📄 PDF hisobot** — "Shu oy", "O'tgan oy" yoki istalgan davr uchun hisobotni bir bosishda yuklab olish.
@@ -124,9 +148,10 @@ Tugmalar o'rniga matnli buyruqlardan ham foydalansa bo'ladi:
 
 ## PDF hisobot ichida nima bo'ladi
 
-1. **Umumiy yakun** — har bir o'qituvchi bo'yicha: kelgan kunlar, kech qolgan kunlar, **jami jarima**, bonus, jazo va ogohlantirishlar soni. Pastida barcha o'qituvchilar bo'yicha umumiy jarima yig'indisi.
+1. **Umumiy yakun** — har bir o'qituvchi bo'yicha: kelgan kunlar, kech qolgan kunlar, **jami jarima**, bonus, jazo, ogohlantirishlar va **o'tkazilgan seanslar** soni. Pastida barcha o'qituvchilar bo'yicha umumiy jarima yig'indisi.
 2. **Kunlik davomat** — sana, kelgan vaqt, belgilangan vaqt, erta oynadagi daqiqalar (5 000 so'm/daqiqa), kech qolgan daqiqalar (7 000 so'm/daqiqa, eng ko'pi 10 daqiqagacha) va o'sha kungi **jarima summasi**.
 3. **Bonus, jazo va ogohlantirishlar** — kimga, qachon, qaysi turi va **sababi** bilan.
+4. **Support teacher seanslari** — har bir seans alohida qator: support teacher, sana, **student ismi, level, mavzu, davomiylik va qo'shimcha ma'lumot**. Yuqorisida jami seanslar soni va umumiy vaqti.
 
 ## Ishga tushirish
 

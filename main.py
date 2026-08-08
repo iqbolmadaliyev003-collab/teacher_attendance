@@ -27,7 +27,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -82,6 +82,17 @@ WEEKDAYS = [
 # Yangi o'qituvchi qo'shilganda beriladigan standart ketish vaqti
 DEFAULT_DEPARTURE = "18:00"
 
+# O'qituvchi turlari. Oddiy o'qituvchi — hozirgi holatda (keldim/tugatdim).
+# Support teacher — shu ustiga tasodifiy kelgan studentlar bilan seans o'tkazadi.
+ROLE_TEACHER = "teacher"
+ROLE_SUPPORT = "support"
+ROLE_LABEL = {ROLE_TEACHER: "Oddiy o'qituvchi", ROLE_SUPPORT: "Support teacher"}
+
+# Support teacher menyusidagi tugmalar
+SESSION_START_BTN = "▶️ Seans boshlash"
+SESSION_FINISH_BTN = "🏁 Seansni tugatdim"
+SESSION_CANCEL_BTN = "❌ Seansni bekor qilish"
+
 # Jazo uchun tayyor sabablar — admin ro'yxatdan tanlaydi
 JAZO_REASONS = [
     "Rangli ichimlik yoki xidli mahsulot iste'mol qilish",
@@ -94,13 +105,20 @@ JAZO_REASONS = [
 
 def db(query: str, params=(), fetch: str | None = None):
     """Barcha SQL so'rovlar uchun bitta yordamchi funksiya.
-    fetch="one" — bitta qator, fetch="all" — hamma qatorlar, aks holda rowcount."""
+    fetch="one" — bitta qator, fetch="all" — hamma qatorlar,
+    fetch="id" — yangi qo'shilgan qatorning id raqami, aks holda rowcount.
+
+    Diqqat: har chaqiruvda yangi ulanish ochiladi, shuning uchun keyingi
+    chaqiruvda "SELECT last_insert_rowid()" 0 qaytaradi — id kerak bo'lsa
+    shu yerdagi fetch="id" dan foydalaning."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(query, params)
         if fetch == "one":
             result = cur.fetchone()
         elif fetch == "all":
             result = cur.fetchall()
+        elif fetch == "id":
+            result = cur.lastrowid
         else:
             result = cur.rowcount
         conn.commit()
@@ -166,6 +184,28 @@ def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- Support teacher seanslari: tasodifiy kelgan student bilan
+            -- o'tkazilgan qo'shimcha tushuntirish mashg'uloti.
+            -- Qatorning uch holati bor:
+            --   finished_at IS NULL                     -> seans davom etmoqda
+            --   finished_at bor, student_name IS NULL   -> tugadi, anketa to'ldirilmagan
+            --   student_name bor                        -> to'liq yozuv (hisobotga tushadi)
+            CREATE TABLE IF NOT EXISTS support_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                session_date TEXT NOT NULL,     -- 'YYYY-MM-DD'
+                started_at TEXT NOT NULL,       -- 'HH:MM:SS'
+                finished_at TEXT,               -- 'HH:MM:SS'
+                duration_minutes INTEGER,       -- boshlanish va tugash orasidagi daqiqalar
+                student_name TEXT,              -- Student's name
+                level TEXT,                     -- level
+                theme TEXT,                     -- theme
+                extra_info TEXT,                -- Additional information
+                FOREIGN KEY (teacher_id) REFERENCES teachers (id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_teacher_date
+                ON support_sessions (teacher_id, session_date);
             """
         )
         # Eski bazalarda bu ustunlar yo'q edi — bor bo'lmasa qo'shamiz
@@ -175,6 +215,12 @@ def init_db():
             conn.execute(
                 "ALTER TABLE teachers ADD COLUMN departure_time TEXT NOT NULL "
                 f"DEFAULT '{DEFAULT_DEPARTURE}'"
+            )
+        if "role" not in teacher_columns:
+            # 'teacher' — oddiy o'qituvchi, 'support' — support teacher.
+            # Eski yozuvlarning hammasi oddiy o'qituvchi bo'lib qoladi.
+            conn.execute(
+                f"ALTER TABLE teachers ADD COLUMN role TEXT NOT NULL DEFAULT '{ROLE_TEACHER}'"
             )
 
         # Eski attendance jadvaliga yangi ustunlarni qo'shamiz (bor bo'lmasa)
@@ -227,28 +273,105 @@ def get_radius() -> int:
 
 
 def get_teacher(telegram_id: int):
-    """(id, telegram_id, ism, familiya, kelish_vaqti, ketish_vaqti) yoki None."""
+    """(id, telegram_id, ism, familiya, kelish_vaqti, ketish_vaqti, turi) yoki None.
+    Yangi ustunlar oxiriga qo'shiladi — eski indekslar o'zgarmaydi."""
     return db(
-        "SELECT id, telegram_id, first_name, last_name, scheduled_time, departure_time "
+        "SELECT id, telegram_id, first_name, last_name, scheduled_time, departure_time, role "
         "FROM teachers WHERE telegram_id = ?",
         (telegram_id,), fetch="one",
     )
 
 
+def is_support(teacher) -> bool:
+    """Shu o'qituvchi support teacher'mi?"""
+    return teacher is not None and teacher[6] == ROLE_SUPPORT
+
+
 def add_teacher(
     telegram_id: int, first_name: str, last_name: str,
     sched_time: str, departure: str = DEFAULT_DEPARTURE,
+    role: str = ROLE_TEACHER,
 ) -> bool:
     try:
         db(
             "INSERT INTO teachers "
-            "(telegram_id, first_name, last_name, scheduled_time, departure_time) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (telegram_id, first_name, last_name, sched_time, departure),
+            "(telegram_id, first_name, last_name, scheduled_time, departure_time, role) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (telegram_id, first_name, last_name, sched_time, departure, role),
         )
         return True
     except sqlite3.IntegrityError:  # bu telegram_id allaqachon mavjud
         return False
+
+
+def set_teacher_role(telegram_id: int, role: str) -> bool:
+    return db(
+        "UPDATE teachers SET role = ? WHERE telegram_id = ?", (role, telegram_id)
+    ) > 0
+
+
+# ---------- Support teacher seanslari ----------
+
+def get_open_session(teacher_id: int):
+    """Hali tugatilmagan seans: (id, boshlangan_vaqt, sana) yoki None.
+    Sana ham kerak: seans yarim tunni kesib o'tsa yoki teacher tugatishni
+    unutib ertasiga bossa, davomiylik to'g'ri hisoblansin."""
+    return db(
+        "SELECT id, started_at, session_date FROM support_sessions "
+        "WHERE teacher_id = ? AND finished_at IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (teacher_id,), fetch="one",
+    )
+
+
+def get_pending_session(teacher_id: int):
+    """Tugagan, lekin anketasi to'ldirilmagan seans: (id, davomiylik) yoki None.
+    Bot qayta ishga tushsa FSM holati yo'qoladi — shu yozuv orqali tiklanadi."""
+    return db(
+        "SELECT id, duration_minutes FROM support_sessions "
+        "WHERE teacher_id = ? AND finished_at IS NOT NULL AND student_name IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (teacher_id,), fetch="one",
+    )
+
+
+def start_session(teacher_id: int, started_at: str) -> int:
+    return db(
+        "INSERT INTO support_sessions (teacher_id, session_date, started_at) VALUES (?, ?, ?)",
+        (teacher_id, today(), started_at), fetch="id",
+    )
+
+
+def finish_session(session_id: int, finished_at: str, duration_minutes: int) -> None:
+    db(
+        "UPDATE support_sessions SET finished_at = ?, duration_minutes = ? WHERE id = ?",
+        (finished_at, duration_minutes, session_id),
+    )
+
+
+def save_session_details(
+    session_id: int, student_name: str, level: str, theme: str, extra_info: str | None
+) -> None:
+    db(
+        "UPDATE support_sessions SET student_name = ?, level = ?, theme = ?, extra_info = ? "
+        "WHERE id = ?",
+        (student_name, level, theme, extra_info, session_id),
+    )
+
+
+def delete_session(session_id: int) -> None:
+    db("DELETE FROM support_sessions WHERE id = ?", (session_id,))
+
+
+def count_sessions(teacher_id: int, date_from: str, date_to: str) -> tuple[int, int]:
+    """Shu davrdagi to'liq seanslar soni va jami daqiqalari."""
+    row = db(
+        "SELECT COUNT(*), COALESCE(SUM(duration_minutes), 0) FROM support_sessions "
+        "WHERE teacher_id = ? AND student_name IS NOT NULL "
+        "AND session_date BETWEEN ? AND ?",
+        (teacher_id, date_from, date_to), fetch="one",
+    )
+    return row[0], row[1]
 
 
 # ---------- Haftalik jadval ----------
@@ -482,11 +605,18 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
     """Foydalanuvchi kimligiga qarab asosiy menyu tugmalari:
     o'qituvchiga — Keldim/Statistika, adminga — boshqaruv tugmalari."""
     rows = []
-    if get_teacher(user.id):
+    teacher = get_teacher(user.id)
+    if teacher:
         rows.append([
             KeyboardButton(text="✅ Keldim"),
             KeyboardButton(text="🏁 Tugatdim"),
         ])
+        # Support teacher'da qo'shimcha seans tugmasi. Seans ochiq bo'lsa —
+        # "tugatdim", aks holda "boshlash" chiqadi.
+        if is_support(teacher):
+            rows.append([KeyboardButton(
+                text=SESSION_FINISH_BTN if get_open_session(teacher[0]) else SESSION_START_BTN
+            )])
         rows.append([
             KeyboardButton(text="📊 Statistikam"),
             KeyboardButton(text="🏅 Bonus va jazolarim"),
@@ -610,12 +740,19 @@ async def cmd_start(message: Message):
         return
 
     first_name, last_name = teacher[2], teacher[3]
-    await message.answer(
+    text = (
         f"Assalomu alaykum, {first_name} {last_name}!\n\n"
-        "Markazga yetib kelganingizda pastdagi \"✅ Keldim\" tugmasini bosing.\n\n"
-        f"<b>Sizning ish jadvalingiz:</b>\n{format_week_schedule(teacher)}",
-        reply_markup=kb,
+        "Markazga yetib kelganingizda pastdagi \"✅ Keldim\" tugmasini bosing.\n"
     )
+    if is_support(teacher):
+        text += (
+            f"\n🎓 Siz <b>{ROLE_LABEL[ROLE_SUPPORT]}</b>siz. Student oldingizga kelib "
+            f"mavzu so'raganda \"{SESSION_START_BTN}\" tugmasini bosing, tushuntirib "
+            f"bo'lgach \"{SESSION_FINISH_BTN}\" ni. Bot davomiylikni o'zi hisoblaydi "
+            "va student haqida bir nechta savol beradi.\n"
+        )
+    text += f"\n<b>Sizning ish jadvalingiz:</b>\n{format_week_schedule(teacher)}"
+    await message.answer(text, reply_markup=kb)
 
 
 # ==================== 5. O'QITUVCHI QISMI ====================
@@ -891,6 +1028,209 @@ async def handle_tugatdim(message: Message):
             logger.exception("Adminga (%s) ketish xabari yuborilmadi", admin_id)
 
 
+# ---------- Support teacher seanslari ----------
+# Tasodifiy student support teacher oldiga kelib, tushunmagan mavzusini aytadi.
+# Teacher "Seans boshlash" ni bosadi, tushuntiradi, so'ng "Seansni tugatdim" ni
+# bosib anketani to'ldiradi. Davomiylikni bot ikki tugma orasidagi vaqtdan
+# o'zi hisoblaydi — teacher qo'lda vaqt yozmaydi.
+
+class SupportSession(StatesGroup):
+    student = State()   # Student's name
+    level = State()     # level
+    theme = State()     # theme
+    extra = State()     # Additional information
+
+
+SESSION_FORM_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=SESSION_CANCEL_BTN)]],
+    resize_keyboard=True,
+)
+
+
+async def ask_session_student(message: Message, state: FSMContext, session_id: int,
+                              duration: int, prefix: str = "") -> None:
+    """Anketaning birinchi savolini beradi (yangi tugagan yoki tiklangan seans uchun)."""
+    await state.set_state(SupportSession.student)
+    await state.update_data(session_id=session_id)
+    await message.answer(
+        prefix +
+        f"⏱ Seans davomiyligi: <b>{format_minutes(duration)}</b>\n\n"
+        "<b>1/4:</b> Student'ning ism-familiyasini yozing.",
+        reply_markup=SESSION_FORM_KB,
+    )
+
+
+@teacher_router.message(F.text == SESSION_START_BTN)
+async def session_start(message: Message, state: FSMContext):
+    teacher = get_teacher(message.from_user.id)
+    if not is_support(teacher):
+        await message.answer(
+            "Bu tugma faqat support teacher uchun.",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return
+
+    teacher_id = teacher[0]
+
+    # Anketasi to'ldirilmagan seans qolgan bo'lsa — avval o'shani tugatsin
+    pending = get_pending_session(teacher_id)
+    if pending:
+        await ask_session_student(
+            message, state, pending[0], pending[1] or 0,
+            prefix="⚠️ Oldingi seansning anketasi to'ldirilmagan. Avval shuni tugataylik.\n\n",
+        )
+        return
+
+    open_session = get_open_session(teacher_id)
+    if open_session:
+        await message.answer(
+            f"Sizda allaqachon ochiq seans bor (boshlangan: {open_session[1]}).\n"
+            f"Tugagach \"{SESSION_FINISH_BTN}\" tugmasini bosing.",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return
+
+    started = datetime.now(TZ).strftime("%H:%M:%S")
+    start_session(teacher_id, started)
+    await message.answer(
+        f"▶️ <b>Seans boshlandi.</b>\n"
+        f"🕒 Boshlangan vaqt: {started}\n\n"
+        f"Mavzuni tushuntirib bo'lgach \"{SESSION_FINISH_BTN}\" tugmasini bosing — "
+        "bot davomiylikni o'zi hisoblaydi va bir nechta savol beradi.",
+        reply_markup=menu_kb(message.from_user),
+    )
+
+
+@teacher_router.message(F.text == SESSION_FINISH_BTN)
+async def session_finish(message: Message, state: FSMContext):
+    teacher = get_teacher(message.from_user.id)
+    if not is_support(teacher):
+        await message.answer(
+            "Bu tugma faqat support teacher uchun.",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return
+
+    teacher_id = teacher[0]
+
+    pending = get_pending_session(teacher_id)
+    if pending:
+        await ask_session_student(
+            message, state, pending[0], pending[1] or 0,
+            prefix="⚠️ Bu seans allaqachon tugatilgan, faqat anketasi to'ldirilmagan.\n\n",
+        )
+        return
+
+    open_session = get_open_session(teacher_id)
+    if not open_session:
+        await message.answer(
+            f"Hozir ochiq seans yo'q. Student kelganda avval \"{SESSION_START_BTN}\" "
+            "tugmasini bosing.",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return
+
+    session_id, started_at, session_date = open_session
+    now = datetime.now(TZ)
+    started_dt = datetime.strptime(
+        f"{session_date} {started_at}", "%Y-%m-%d %H:%M:%S"
+    ).replace(tzinfo=TZ)
+    duration = max(round((now - started_dt).total_seconds() / 60), 0)
+
+    finish_session(session_id, now.strftime("%H:%M:%S"), duration)
+    await ask_session_student(message, state, session_id, duration)
+
+
+@teacher_router.message(StateFilter(SupportSession), F.text == SESSION_CANCEL_BTN)
+async def session_cancel(message: Message, state: FSMContext):
+    """Anketa to'ldirilmasa seans yozuvi butunlay o'chiriladi —
+    hisobotda yarim yozuv qolib ketmasin."""
+    data = await state.get_data()
+    await state.clear()
+    if data.get("session_id"):
+        delete_session(data["session_id"])
+    await message.answer(
+        "❌ Seans bekor qilindi va yozuvdan o'chirildi.",
+        reply_markup=menu_kb(message.from_user),
+    )
+
+
+@teacher_router.message(SupportSession.student, F.text)
+async def session_step_student(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("Ism juda qisqa. Iltimos, to'liqroq yozing.")
+        return
+    await state.update_data(student_name=name)
+    await state.set_state(SupportSession.level)
+    await message.answer("<b>2/4:</b> Student'ning level'ini yozing (masalan: A2, B1, Beginner).")
+
+
+@teacher_router.message(SupportSession.level, F.text)
+async def session_step_level(message: Message, state: FSMContext):
+    await state.update_data(level=message.text.strip())
+    await state.set_state(SupportSession.theme)
+    await message.answer(
+        "<b>3/4:</b> Qaysi mavzuni tushuntirdingiz? (theme)\n"
+        "Masalan: Present Perfect, Conditionals."
+    )
+
+
+@teacher_router.message(SupportSession.theme, F.text)
+async def session_step_theme(message: Message, state: FSMContext):
+    theme = message.text.strip()
+    if len(theme) < 2:
+        await message.answer("Mavzu juda qisqa. Iltimos, aniqroq yozing.")
+        return
+    await state.update_data(theme=theme)
+    await state.set_state(SupportSession.extra)
+    await message.answer(
+        "<b>4/4:</b> Qo'shimcha ma'lumot (additional information).\n\n"
+        "💡 Yozadigan narsa bo'lmasa <code>-</code> yuboring."
+    )
+
+
+@teacher_router.message(SupportSession.extra, F.text)
+async def session_step_extra(message: Message, state: FSMContext):
+    extra = message.text.strip()
+    if extra == "-":
+        extra = None
+
+    data = await state.get_data()
+    await state.clear()
+    save_session_details(
+        data["session_id"], data["student_name"], data["level"], data["theme"], extra,
+    )
+
+    teacher = get_teacher(message.from_user.id)
+    summary = (
+        "✅ <b>Seans yozuvga olindi.</b>\n\n"
+        f"👤 Student: {data['student_name']}\n"
+        f"📶 Level: {data['level']}\n"
+        f"📚 Mavzu: {data['theme']}\n"
+    )
+    if extra:
+        summary += f"📝 Qo'shimcha: {extra}\n"
+    summary += "\nBu yozuv admin hisobotida ko'rinadi."
+    await message.answer(summary, reply_markup=menu_kb(message.from_user))
+
+    # Adminlarga darhol xabar — kim, kim bilan, qaysi mavzuda ishlagani ko'rinib tursin
+    if teacher:
+        notice = (
+            "🎓 <b>Support seans yakunlandi</b>\n"
+            f"👨‍🏫 {teacher[2]} {teacher[3]}\n"
+            f"👤 Student: {data['student_name']} ({data['level']})\n"
+            f"📚 Mavzu: {data['theme']}\n"
+        )
+        if extra:
+            notice += f"📝 {extra}\n"
+        for admin_id in ADMIN_IDS:
+            try:
+                await message.bot.send_message(admin_id, notice)
+            except TelegramAPIError:
+                logger.exception("Adminga (%s) seans xabari yuborilmadi", admin_id)
+
+
 @teacher_router.message(F.text == "📊 Statistikam")
 async def handle_stats_menu(message: Message):
     if not get_teacher(message.from_user.id):
@@ -945,6 +1285,20 @@ async def handle_stats_callback(callback: CallbackQuery):
             )
         else:
             text += "🎉 Jarima yo'q — baraka toping!"
+
+    # Support teacher'ga shu davrdagi seanslari ham ko'rsatiladi
+    if is_support(teacher):
+        session_count, session_minutes = count_sessions(
+            teacher[0], date_from.isoformat(), today_date.isoformat()
+        )
+        text += "\n\n🎓 <b>Support seanslar</b>\n"
+        if session_count:
+            text += (
+                f"👥 O'tkazilgan seanslar: {session_count}\n"
+                f"⏱ Umumiy vaqt: {format_minutes(session_minutes)}"
+            )
+        else:
+            text += "Bu davrda seans o'tkazilmagan."
 
     try:
         await callback.message.edit_text(text)
@@ -1018,6 +1372,7 @@ class AddTeacher(StatesGroup):
     last_name = State()
     sched_time = State()
     departure = State()
+    role = State()
 
 
 class ChangeTime(StatesGroup):
@@ -1060,7 +1415,7 @@ async def cancel_action(message: Message, state: FSMContext):
 async def add_step_start(message: Message, state: FSMContext):
     await state.set_state(AddTeacher.tg_id)
     await message.answer(
-        "<b>1/5-qadam:</b> O'qituvchining Telegram ID raqamini yuboring.\n\n"
+        "<b>1/6-qadam:</b> O'qituvchining Telegram ID raqamini yuboring.\n\n"
         "💡 IDni bilish oson: o'qituvchi botga /start yozsa, bot unga ID raqamini "
         "ko'rsatadi — o'sha raqamni sizga yuborsin.\n"
         "Yoki o'qituvchidan kelgan istalgan xabarni shu yerga forward qiling.",
@@ -1094,21 +1449,21 @@ async def add_step_id(message: Message, state: FSMContext):
 
     await state.update_data(tg_id=tg_id)
     await state.set_state(AddTeacher.first_name)
-    await message.answer(f"ID qabul qilindi: <code>{tg_id}</code>\n\n<b>2/5-qadam:</b> Ismini yozing (masalan: Ali).")
+    await message.answer(f"ID qabul qilindi: <code>{tg_id}</code>\n\n<b>2/6-qadam:</b> Ismini yozing (masalan: Ali).")
 
 
 @panel_router.message(AddTeacher.first_name, F.text)
 async def add_step_first_name(message: Message, state: FSMContext):
     await state.update_data(first_name=message.text.strip())
     await state.set_state(AddTeacher.last_name)
-    await message.answer("<b>3/5-qadam:</b> Familiyasini yozing (masalan: Valiyev).")
+    await message.answer("<b>3/6-qadam:</b> Familiyasini yozing (masalan: Valiyev).")
 
 
 @panel_router.message(AddTeacher.last_name, F.text)
 async def add_step_last_name(message: Message, state: FSMContext):
     await state.update_data(last_name=message.text.strip())
     await state.set_state(AddTeacher.sched_time)
-    await message.answer("<b>4/5-qadam:</b> Ishga kelish vaqtini yozing (masalan: 09:00).")
+    await message.answer("<b>4/6-qadam:</b> Ishga kelish vaqtini yozing (masalan: 09:00).")
 
 
 @panel_router.message(AddTeacher.sched_time, F.text)
@@ -1121,9 +1476,19 @@ async def add_step_time(message: Message, state: FSMContext):
     await state.update_data(sched_time=sched_time)
     await state.set_state(AddTeacher.departure)
     await message.answer(
-        "<b>5/5-qadam:</b> Markazdan ketish vaqtini yozing (masalan: 18:00).\n\n"
+        "<b>5/6-qadam:</b> Markazdan ketish vaqtini yozing (masalan: 18:00).\n\n"
         f"💡 O'tkazib yuborish uchun <code>-</code> yuboring — standart {DEFAULT_DEPARTURE} qo'yiladi."
     )
+
+
+ROLE_PICK_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=f"👨‍🏫 {ROLE_LABEL[ROLE_TEACHER]}")],
+        [KeyboardButton(text=f"🎓 {ROLE_LABEL[ROLE_SUPPORT]}")],
+        [KeyboardButton(text="❌ Bekor qilish")],
+    ],
+    resize_keyboard=True,
+)
 
 
 @panel_router.message(AddTeacher.departure, F.text)
@@ -1135,20 +1500,51 @@ async def add_step_departure(message: Message, state: FSMContext):
         await message.answer("Vaqt HH:MM formatida bo'lishi kerak, masalan: 18:00. Qaytadan yozing.")
         return
 
+    await state.update_data(departure=departure)
+    await state.set_state(AddTeacher.role)
+    await message.answer(
+        "<b>6/6-qadam:</b> O'qituvchining turini tanlang.\n\n"
+        f"👨‍🏫 <b>{ROLE_LABEL[ROLE_TEACHER]}</b> — faqat kelish/ketish belgilaydi.\n"
+        f"🎓 <b>{ROLE_LABEL[ROLE_SUPPORT]}</b> — kelish/ketishdan tashqari, "
+        "tasodifiy kelgan studentlar bilan seans o'tkazadi va har bir seansni "
+        "botga yozib boradi.",
+        reply_markup=ROLE_PICK_KB,
+    )
+
+
+@panel_router.message(AddTeacher.role, F.text)
+async def add_step_role(message: Message, state: FSMContext):
+    choice = message.text.strip()
+    if ROLE_LABEL[ROLE_SUPPORT] in choice:
+        role = ROLE_SUPPORT
+    elif ROLE_LABEL[ROLE_TEACHER] in choice:
+        role = ROLE_TEACHER
+    else:
+        await message.answer("Iltimos, pastdagi ikkita tugmadan birini bosing.")
+        return
+
     data = await state.get_data()
     await state.clear()
+    departure = data["departure"]
 
     if add_teacher(data["tg_id"], data["first_name"], data["last_name"],
-                   data["sched_time"], departure):
-        await message.answer(
+                   data["sched_time"], departure, role):
+        text = (
             f"✅ <b>{data['first_name']} {data['last_name']}</b> ro'yxatga qo'shildi!\n"
+            f"🎭 Turi: {ROLE_LABEL[role]}\n"
             f"🕘 Kelish vaqti: {data['sched_time']}\n"
             f"🕕 Ketish vaqti: {departure}\n\n"
             "Endi u botga /start yozib, \"✅ Keldim\" tugmasidan foydalana oladi.\n"
-            "💡 Hafta kunlariga alohida vaqt kerak bo'lsa — \"📋 O'qituvchilar ro'yxati\" "
-            "dan 🗓 tugmasini bosing.",
-            reply_markup=menu_kb(message.from_user),
         )
+        if role == ROLE_SUPPORT:
+            text += (
+                f"🎓 Menyusida qo'shimcha \"{SESSION_START_BTN}\" tugmasi ham chiqadi.\n"
+            )
+        text += (
+            "💡 Hafta kunlariga alohida vaqt kerak bo'lsa — \"📋 O'qituvchilar ro'yxati\" "
+            "dan 🗓 tugmasini bosing."
+        )
+        await message.answer(text, reply_markup=menu_kb(message.from_user))
     else:
         await message.answer(
             "⚠️ Bu ID bilan o'qituvchi allaqachon mavjud.",
@@ -1161,8 +1557,10 @@ async def add_step_departure(message: Message, state: FSMContext):
 @panel_router.message(F.text == "📋 O'qituvchilar ro'yxati")
 async def show_teachers_list(message: Message):
     teachers = db(
-        "SELECT first_name, last_name, scheduled_time, departure_time, telegram_id FROM teachers "
-        "ORDER BY first_name, last_name",
+        # role ASC: 'support' 'teacher' dan oldin keladi — support teacherlar
+        # ro'yxat boshida guruhlanib turadi
+        "SELECT first_name, last_name, scheduled_time, departure_time, telegram_id, role "
+        "FROM teachers ORDER BY role ASC, first_name, last_name",
         fetch="all",
     )
     if not teachers:
@@ -1172,25 +1570,55 @@ async def show_teachers_list(message: Message):
         )
         return
 
-    # Har bir o'qituvchi uchun: ⏰ — vaqt, 🗓 — haftalik jadval, 🗑 — o'chirish
+    # Har bir o'qituvchi uchun: ⏰ — vaqt, 🗓 — haftalik jadval, 🎭 — turi, 🗑 — o'chirish
     rows = []
-    for first, last, sched, departure, tg_id in teachers:
+    support_count = 0
+    for first, last, sched, departure, tg_id, role in teachers:
+        if role == ROLE_SUPPORT:
+            support_count += 1
+        icon = "🎓" if role == ROLE_SUPPORT else "👨‍🏫"
         rows.append([InlineKeyboardButton(
-            text=f"{first} {last} — {sched}/{departure}", callback_data=f"time:{tg_id}"
+            text=f"{icon} {first} {last} — {sched}/{departure}", callback_data=f"time:{tg_id}"
         )])
         rows.append([
             InlineKeyboardButton(text="⏰ Vaqt", callback_data=f"time:{tg_id}"),
-            InlineKeyboardButton(text="🗓 Haftalik jadval", callback_data=f"sched:{tg_id}"),
+            InlineKeyboardButton(text="🗓 Jadval", callback_data=f"sched:{tg_id}"),
+            InlineKeyboardButton(text="🎭 Turi", callback_data=f"role:{tg_id}"),
             InlineKeyboardButton(text="🗑", callback_data=f"del:{tg_id}"),
         ])
 
     await message.answer(
-        f"📋 O'qituvchilar ro'yxati ({len(teachers)} ta):\n"
-        "Nom yonidagi raqamlar — kelish/ketish vaqti.\n\n"
+        f"📋 O'qituvchilar ro'yxati ({len(teachers)} ta, shundan "
+        f"{support_count} ta support):\n"
+        "Nom yonidagi raqamlar — kelish/ketish vaqti.\n"
+        f"🎓 — {ROLE_LABEL[ROLE_SUPPORT]}, 👨‍🏫 — {ROLE_LABEL[ROLE_TEACHER]}\n\n"
         "⏰ — standart kelish va ketish vaqtini o'zgartirish\n"
         "🗓 — hafta kunlariga alohida vaqt belgilash\n"
+        "🎭 — turini almashtirish (oddiy ↔ support)\n"
         "🗑 — ro'yxatdan o'chirish",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@panel_router.callback_query(F.data.startswith("role:"))
+async def toggle_role(callback: CallbackQuery):
+    tg_id = int(callback.data.split(":")[1])
+    teacher = get_teacher(tg_id)
+    if not teacher:
+        await callback.answer("O'qituvchi topilmadi.", show_alert=True)
+        return
+
+    new_role = ROLE_TEACHER if teacher[6] == ROLE_SUPPORT else ROLE_SUPPORT
+    set_teacher_role(tg_id, new_role)
+    await callback.answer(f"Endi: {ROLE_LABEL[new_role]}")
+    await callback.message.answer(
+        f"🎭 <b>{teacher[2]} {teacher[3]}</b> endi — <b>{ROLE_LABEL[new_role]}</b>.\n\n"
+        + (
+            f"Menyusida \"{SESSION_START_BTN}\" tugmasi paydo bo'ladi. "
+            "Tugma ko'rinishi uchun u botga /start yozsin."
+            if new_role == ROLE_SUPPORT else
+            "Seans tugmasi olib tashlandi. Eski seans yozuvlari hisobotda qoladi."
+        )
     )
 
 
@@ -1742,8 +2170,8 @@ def pdf_text(value, unicode_font: bool) -> str:
     return text.encode("latin-1", "replace").decode("latin-1")
 
 
-def build_report_pdf(records, marks, date_from, date_to) -> bytes:
-    """Davomat va bonus/jazo ma'lumotlaridan PDF yasaydi."""
+def build_report_pdf(records, marks, sessions, date_from, date_to) -> bytes:
+    """Davomat, bonus/jazo va support seanslaridan PDF yasaydi."""
     pdf = FPDF(orientation="P", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     font, unicode_font = setup_pdf_font(pdf)
@@ -1783,7 +2211,7 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     # ---- 1-jadval: har bir o'qituvchi bo'yicha yakun ----
     def new_item():
         return {"days": 0, "late": 0, "minutes": 0, "fine": 0,
-                "bonus": 0, "jazo": 0, "ogohlantirish": 0}
+                "bonus": 0, "jazo": 0, "ogohlantirish": 0, "sessions": 0}
 
     summary: dict[str, dict] = {}
     for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine, _left in records:
@@ -1796,6 +2224,9 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     for first, last, mark_type, _reason, _date in marks:
         item = summary.setdefault(f"{first} {last}", new_item())
         item[mark_type] += 1
+    for first, last, *_rest in sessions:
+        item = summary.setdefault(f"{first} {last}", new_item())
+        item["sessions"] += 1
 
     total_fine_all = sum(item["fine"] for item in summary.values())
 
@@ -1803,15 +2234,16 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     pdf.cell(0, 8, safe("1. Umumiy yakun"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     table(
-        ["O'qituvchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo", "Ogoh."],
+        ["O'qituvchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo", "Ogoh.", "Seans"],
         [
             [name, item["days"], item["late"],
              format_money(item["fine"]) if item["fine"] else "-",
-             item["bonus"], item["jazo"], item["ogohlantirish"]]
+             item["bonus"], item["jazo"], item["ogohlantirish"],
+             item["sessions"] or "-"]
             for name, item in sorted(summary.items())
         ],
-        widths=(46, 20, 22, 42, 16, 16, 18),
-        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER", "CENTER"),
+        widths=(42, 18, 20, 38, 14, 14, 16, 16),
+        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER", "CENTER", "CENTER"),
     )
     pdf.ln(2)
     pdf.set_font(font, "B", 10)
@@ -1866,6 +2298,36 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     else:
         pdf.cell(0, 6, safe("Bu davrda bonus, jazo yoki ogohlantirish berilmagan."),
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(6)
+
+    # ---- 4-jadval: support teacher seanslari ----
+    # Har bir seans — tasodifiy kelgan student bilan o'tkazilgan tushuntirish.
+    pdf.set_font(font, "B", 12)
+    pdf.cell(0, 8, safe("4. Support teacher seanslari"),
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font(font, "", 9)
+    if sessions:
+        total_minutes = sum(row[6] or 0 for row in sessions)  # row[6] — duration_minutes
+        pdf.set_font(font, "", 8)
+        pdf.cell(0, 5, safe(
+            f"Jami {len(sessions)} ta seans, umumiy davomiyligi {format_minutes(total_minutes)}."),
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font(font, "", 9)
+        table(
+            ["Support teacher", "Sana", "Student", "Level", "Mavzu", "Vaqt", "Qo'shimcha"],
+            [
+                [f"{first} {last}", date, student, level, theme,
+                 f"{duration} daq." if duration is not None else "-",
+                 extra or "-"]
+                for first, last, date, student, level, theme, duration, extra, _st, _fin
+                in sessions
+            ],
+            widths=(32, 20, 30, 14, 38, 16, 30),
+            aligns=("LEFT", "CENTER", "LEFT", "CENTER", "LEFT", "CENTER", "LEFT"),
+        )
+    else:
+        pdf.cell(0, 6, safe("Bu davrda support seansi o'tkazilmagan."),
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     return bytes(pdf.output())
 
@@ -1895,31 +2357,52 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
         (date_from.isoformat(), date_to.isoformat()), fetch="all",
     )
 
-    if not records and not marks:
+    # Support teacher seanslari — faqat anketasi to'liq to'ldirilganlari
+    sessions = db(
+        """
+        SELECT t.first_name, t.last_name, s.session_date, s.student_name, s.level,
+               s.theme, s.duration_minutes, s.extra_info, s.started_at, s.finished_at
+        FROM support_sessions s
+        JOIN teachers t ON t.id = s.teacher_id
+        WHERE s.session_date BETWEEN ? AND ? AND s.student_name IS NOT NULL
+        ORDER BY s.session_date, s.started_at
+        """,
+        (date_from.isoformat(), date_to.isoformat()), fetch="all",
+    )
+
+    if not records and not marks and not sessions:
         await message.answer(
             f"{date_from.isoformat()} — {date_to.isoformat()} oralig'ida "
-            "davomat, bonus yoki jazo yozuvi topilmadi."
+            "davomat, bonus, jazo yoki seans yozuvi topilmadi."
         )
         return
 
-    pdf_bytes = build_report_pdf(records, marks, date_from, date_to)
+    pdf_bytes = build_report_pdf(records, marks, sessions, date_from, date_to)
     bonus_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "bonus")
     jazo_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "jazo")
     ogoh_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "ogohlantirish")
     total_fine = sum(row[8] for row in records)
+    session_minutes = sum(row[6] or 0 for row in sessions)
+
+    caption = (
+        f"📄 Davomat hisoboti\n"
+        f"Davr: {date_from.isoformat()} — {date_to.isoformat()}\n"
+        f"📊 Davomat yozuvlari: {len(records)}\n"
+        f"💰 Jami jarima: {format_money(total_fine)}\n"
+        f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {jazo_count}   🔔 Ogohlantirishlar: {ogoh_count}"
+    )
+    if sessions:
+        caption += (
+            f"\n🎓 Support seanslar: {len(sessions)} ta "
+            f"({format_minutes(session_minutes)})"
+        )
 
     await message.answer_document(
         BufferedInputFile(
             pdf_bytes,
             filename=f"davomat_{date_from.isoformat()}_{date_to.isoformat()}.pdf",
         ),
-        caption=(
-            f"📄 Davomat hisoboti\n"
-            f"Davr: {date_from.isoformat()} — {date_to.isoformat()}\n"
-            f"📊 Davomat yozuvlari: {len(records)}\n"
-            f"💰 Jami jarima: {format_money(total_fine)}\n"
-            f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {jazo_count}   🔔 Ogohlantirishlar: {ogoh_count}"
-        ),
+        caption=caption,
     )
 
 
