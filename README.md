@@ -159,6 +159,29 @@ Tugmalar o'rniga matnli buyruqlardan ham foydalansa bo'ladi:
 python main.py
 ```
 
+## Render.com'ga deploy qilish
+
+1. Repodagi barcha o'zgarishlar GitHub'da bo'lishi kerak (`git push`).
+2. [dashboard.render.com](https://dashboard.render.com) ga kiring (**iqbolmadaliyev003@gmail.com** akkaunt bilan).
+3. **New +** → **Background Worker** ni tanlang.
+4. GitHub akkauntni ulang va `iqbolmadaliyev003-collab/teacher_attendance` reposini tanlang.
+5. Sozlamalar:
+   - **Name:** teacher-attendance-bot
+   - **Runtime:** Python 3
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `python main.py`
+   - **Instance Type:** Starter ($7/oy; bepul rejimda ham ishlaydi, lekin 15 daqiqa faolsizlikda uxlab qolishi mumkin)
+6. **Environment** bo'limida o'zgaruvchi qo'shing:
+   - **Key:** `BOT_TOKEN`
+   - **Value:** @BotFather'dan olingan tokeningiz
+7. **Create Background Worker** ni bosing — Render build qilib, botni avtomatik ishga tushiradi. Loglarda "Bot ishga tushdi" ko'rinsa, hammasi tayyor.
+8. Har bir `git push`dan keyin Render avtomatik qayta deploy qiladi.
+
+**Maslahatlar:**
+- Telegram botda HTTP server kerak emas — shuning uchun **Background Worker** turi tanlanadi (**Web Service** emas!).
+- Baza fayli (`attendance.db`) deploy'da yo'qolmasligi uchun Render'da **Disk** ulash mumkin: Worker → Settings → Disks → Mount Path `/data`, va Environment'da `DB_PATH=/data/attendance.db` qo'shing.
+- Repodagi `render.yaml` (Blueprint) orqali ham deploy qilsa bo'ladi: **New +** → **Blueprint** → repni tanlash.
+
 ## Railway'ga deploy qilish
 
 1. Loyihani GitHub'ga yuklang (`git push`). Token GitHub'ga tushmaydi — u faqat `.env` faylida (git'dan tashqarida) turadi.

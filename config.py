@@ -94,4 +94,6 @@ WARNING_STRIKE_LIMIT = 3
 TIMEZONE = "Asia/Tashkent"
 
 # Ma'lumotlar bazasi fayli
-DB_PATH = "attendance.db"
+# Render'da persistent disk ulanganda Environment'da
+# DB_PATH=/data/attendance.db deb belgilash mumkin.
+DB_PATH = os.getenv("DB_PATH", "attendance.db")
