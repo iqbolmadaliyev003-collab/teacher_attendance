@@ -68,7 +68,13 @@ TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 ALREADY_CHECKED = "Siz bugun allaqachon kelganingizni belgilagansiz. ✅"
-ALREADY_LEFT = "Siz bugun allaqachon ish tugatganingizni belgilagansiz. 🏁"
+# "Tugatdim" bosib, jonli joylashuv kutilayotgan ustozlar (telegram_id: faqat xotirada)
+PENDING_DEPARTURE: set[int] = set()
+# ustoz id -> [(admin_chat_id, message_id)] — adminlarga yuborilgan jonli lokatsiyalar
+LIVE_TRACKS: dict[int, list[tuple[int, int]]] = {}
+LIVE_PERIOD = 86400  # Telegram maksimumi: 24 soat
+
+ALREADY_LEFT ="Siz bugun allaqachon ish tugatganingizni belgilagansiz. 🏁"
 NOT_CHECKED_IN = (
     "Siz bugun hali kelganingizni belgilamagansiz.\n"
     "Avval \"✅ Keldim\" tugmasini bosing."
@@ -786,6 +792,11 @@ async def handle_location(message: Message):
 
     teacher_id, first_name, last_name = teacher[0], teacher[2], teacher[3]
 
+    # "Tugatdim" bosilgan bo'lsa — bu joylashuv ketishni tasdiqlash uchun
+    if teacher_id in PENDING_DEPARTURE:
+        await finish_departure(message, teacher)
+        return
+
     if has_checked_in_today(teacher_id):
         await message.answer(ALREADY_CHECKED)
         return
@@ -971,6 +982,37 @@ async def handle_tugatdim(message: Message):
         await message.answer(ALREADY_LEFT)
         return
 
+    # Ketishni tasdiqlash uchun JONLI joylashuv so'raymiz — adminlar yo'lda ham ko'rib turadi
+    PENDING_DEPARTURE.add(teacher_id)
+    await message.answer(
+        "Ketishni tasdiqlash uchun <b>jonli joylashuvingizni</b> (live location) yuboring 👇\n\n"
+        "📎 belgisini bosing → <b>Location</b> (Joylashuv) → "
+        "<b>Share My Live Location</b> (Jonli joylashuvni ulashish).\n\n"
+        "🚶 Yo'lda ketayotganingizda ham joylashuvingiz adminlarga ko'rinib turadi, "
+        "shuning uchun uyga yetguncha o'chirmang.\n"
+        "⚠️ Oddiy (xaritada belgilangan) joylashuv qabul qilinmaydi."
+    )
+
+
+async def finish_departure(message: Message, teacher) -> None:
+    """Jonli joylashuv kelgach ketishni yozadi va lokatsiyani adminlarga uzatadi."""
+    teacher_id, first_name, last_name = teacher[0], teacher[2], teacher[3]
+
+    if has_checked_out_today(teacher_id):
+        PENDING_DEPARTURE.discard(teacher_id)
+        await message.answer(ALREADY_LEFT)
+        return
+
+    if message.forward_origin is not None or message.location.live_period is None:
+        await message.answer(
+            "❌ Oddiy yoki forward qilingan joylashuv qabul qilinmaydi.\n\n"
+            "Iltimos, <b>jonli joylashuv</b> yuboring:\n"
+            "📎 → <b>Location</b> → <b>Share My Live Location</b> "
+            "(Jonli joylashuvni ulashish).",
+            reply_markup=menu_kb(message.from_user),
+        )
+        return  # PENDING_DEPARTURE saqlanadi — ustoz qayta yuboradi
+
     now = datetime.now(TZ)
     left = now.strftime("%H:%M:%S")
 
@@ -987,6 +1029,7 @@ async def handle_tugatdim(message: Message):
             left_early = True
             early_minutes = ceil((leave_dt - now).total_seconds() / 60)
 
+    PENDING_DEPARTURE.discard(teacher_id)
     if not record_checkout(teacher_id, left):
         await message.answer(ALREADY_LEFT)
         return
@@ -1021,11 +1064,39 @@ async def handle_tugatdim(message: Message):
         await message.bot.send_message(GROUP_CHAT_ID, notice)
     except TelegramAPIError:
         logger.exception("Guruhga (%s) ketish xabari yuborilmadi", GROUP_CHAT_ID)
+    tracks = []
     for admin_id in ADMIN_IDS:
         try:
             await message.bot.send_message(admin_id, notice)
+            sent = await message.bot.send_location(
+                admin_id,
+                message.location.latitude,
+                message.location.longitude,
+                live_period=LIVE_PERIOD,
+                horizontal_accuracy=message.location.horizontal_accuracy,
+                heading=message.location.heading,
+            )
+            tracks.append((admin_id, sent.message_id))
         except TelegramAPIError:
             logger.exception("Adminga (%s) ketish xabari yuborilmadi", admin_id)
+    LIVE_TRACKS[teacher_id] = tracks
+
+
+@teacher_router.edited_message(F.location)
+async def handle_live_location_update(message: Message):
+    """Ustoz jonli joylashuvi yangilanganda adminlardagi nusxani ham yangilaydi."""
+    for chat_id, msg_id in LIVE_TRACKS.get(message.from_user.id, []):
+        try:
+            await message.bot.edit_message_live_location(
+                latitude=message.location.latitude,
+                longitude=message.location.longitude,
+                chat_id=chat_id,
+                message_id=msg_id,
+                horizontal_accuracy=message.location.horizontal_accuracy,
+                heading=message.location.heading,
+            )
+        except TelegramAPIError:
+            pass  # xabar eskirgan yoki o'zgarmagan — e'tiborsiz qoldiramiz
 
 
 # ---------- Support teacher seanslari ----------
