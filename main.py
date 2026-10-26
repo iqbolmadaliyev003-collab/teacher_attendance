@@ -1793,7 +1793,13 @@ def schedule_text(teacher, selected: set[int]) -> str:
         f"🗓 <b>{teacher[2]} {teacher[3]}</b> — haftalik jadval\n\n"
         f"{format_week_schedule(teacher)}\n\n"
         f"<b>Belgilangan kunlar:</b> {chosen}\n\n"
-        "Kunlarni bosib belgilang, so'ng pastdagi amallardan birini tanlang."
+        "Kunlarni bosib belgilang, so'ng pastdagi amallardan birini tanlang.\n\n"
+        "⚡️ <b>Tez usul:</b> har bir kunga alohida vaqtni bitta xabarda yozing "
+        "(har kun yangi qatorda):\n"
+        "<code>Dushanba 8:00-17:00\n"
+        "Seshanba 9:00-18:00\n"
+        "Chorshanba 12:00-20:00\n"
+        "Yakshanba dam</code>"
     )
 
 
@@ -1839,6 +1845,84 @@ async def schedule_toggle_day(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def parse_time_loose(text: str) -> str | None:
+    """'8', '8.30', '08:00' -> 'HH:MM' (yoki None)."""
+    text = text.strip().replace(".", ":")
+    if text.isdigit():
+        text += ":00"
+    if not TIME_RE.match(text):
+        return None
+    hour, minute = text.split(":")
+    return f"{int(hour):02d}:{minute}"
+
+
+def find_weekday(token: str) -> int | None:
+    """'dushanba', 'du', 'chor' -> hafta kuni raqami (0 = dushanba)."""
+    token = token.strip().lower()
+    if len(token) < 2:
+        return None
+    for weekday, name in enumerate(WEEKDAYS):
+        if name.lower().startswith(token):
+            return weekday
+    return None
+
+
+SCHEDULE_LINE_RE = re.compile(
+    r"^(\S+)\s+(?:(dam\w*)|(\d{1,2}(?:[:.]\d{2})?)(?:\s*[-–—]\s*(\d{1,2}(?:[:.]\d{2})?))?)\s*$",
+    re.IGNORECASE,
+)
+
+
+@panel_router.message(EditSchedule.picking, F.text)
+async def schedule_quick_text(message: Message, state: FSMContext):
+    """Tez usul: 'Dushanba 8:00-17:00' qatorlari bilan butun haftani bir yo'la belgilash."""
+    data = await state.get_data()
+    teacher = get_teacher(data["tg_id"])
+    if not teacher:
+        await message.answer("⚠️ Bu o'qituvchi topilmadi.")
+        return
+
+    entries, errors = [], []
+    for line in message.text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = SCHEDULE_LINE_RE.match(line)
+        weekday = find_weekday(match.group(1)) if match else None
+        if weekday is None:
+            errors.append(line)
+            continue
+        if match.group(2):  # "dam"
+            entries.append((weekday, None, None))
+            continue
+        arrive = parse_time_loose(match.group(3))
+        leave = parse_time_loose(match.group(4)) if match.group(4) else None
+        if arrive is None or (match.group(4) and leave is None):
+            errors.append(line)
+            continue
+        entries.append((weekday, arrive, leave))
+
+    if errors:
+        await message.answer(
+            "❌ Quyidagi qatorlarni tushunmadim, hech narsa saqlanmadi:\n"
+            + "\n".join(f"• {line}" for line in errors)
+            + "\n\nNamuna: <code>Dushanba 8:00-17:00</code> yoki <code>Yakshanba dam</code>"
+        )
+        return
+    if not entries:
+        await message.answer("Kunlar va vaqtlarni yozing, masalan: <code>Dushanba 8:00-17:00</code>")
+        return
+
+    for weekday, arrive, leave in entries:
+        set_day_schedule(teacher[0], weekday, arrive, leave)
+    await state.update_data(days=[])
+    await message.answer(
+        f"✅ <b>{teacher[2]} {teacher[3]}</b> jadvali saqlandi:\n\n"
+        f"{format_week_schedule(get_teacher(teacher[1]))}",
+        reply_markup=schedule_kb(set()),
+    )
+
+
 @panel_router.callback_query(EditSchedule.picking, F.data == "sset")
 async def schedule_ask_arrive(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1857,8 +1941,8 @@ async def schedule_ask_arrive(callback: CallbackQuery, state: FSMContext):
 
 @panel_router.message(EditSchedule.arrive, F.text)
 async def schedule_save_arrive(message: Message, state: FSMContext):
-    arrive = message.text.strip()
-    if not TIME_RE.match(arrive):
+    arrive = parse_time_loose(message.text)
+    if arrive is None:
         await message.answer("Vaqt HH:MM formatida bo'lishi kerak, masalan: 12:00. Qaytadan yozing.")
         return
 
@@ -1875,17 +1959,23 @@ async def schedule_save_leave(message: Message, state: FSMContext):
     leave = message.text.strip()
     if leave == "-":
         leave = None
-    elif not TIME_RE.match(leave):
-        await message.answer("Vaqt HH:MM formatida bo'lishi kerak, masalan: 18:00. Qaytadan yozing.")
-        return
+    else:
+        leave = parse_time_loose(leave)
+        if leave is None:
+            await message.answer("Vaqt HH:MM formatida bo'lishi kerak, masalan: 18:00. Qaytadan yozing.")
+            return
 
     data = await state.get_data()
-    await state.clear()
 
     teacher = get_teacher(data["tg_id"])
     if not teacher:
+        await state.clear()
         await message.answer("⚠️ Bu o'qituvchi topilmadi.", reply_markup=menu_kb(message.from_user))
         return
+
+    # Jadval muharririda qolamiz — admin keyingi kunga darhol vaqt belgilay oladi
+    await state.set_state(EditSchedule.picking)
+    await state.update_data(days=[])
 
     for weekday in data["days"]:
         set_day_schedule(teacher[0], weekday, data["arrive"], leave)
@@ -1895,8 +1985,9 @@ async def schedule_save_leave(message: Message, state: FSMContext):
         f"✅ <b>{teacher[2]} {teacher[3]}</b> uchun saqlandi:\n"
         f"📅 {days_text}\n"
         f"🕘 Kelish: {data['arrive']}   🕕 Ketish: {leave or '—'}\n\n"
-        f"<b>Yangi jadval:</b>\n{format_week_schedule(get_teacher(data['tg_id']))}",
-        reply_markup=menu_kb(message.from_user),
+        f"<b>Yangi jadval:</b>\n{format_week_schedule(get_teacher(data['tg_id']))}\n\n"
+        "Keyingi kunni bosib davom eting yoki ⬅️ Bekor qilish bilan chiqing.",
+        reply_markup=schedule_kb(set()),
     )
 
 
